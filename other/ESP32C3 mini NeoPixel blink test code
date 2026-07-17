@@ -1,0 +1,31 @@
+#include <Adafruit_NeoPixel.h>
+
+#define PIN        8 
+#define NUMPIXELS  1 
+
+Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+  pixels.begin();           
+  pixels.setBrightness(50); 
+  
+  // Seed the random generator using noise from an empty pin
+  randomSeed(analogRead(0)); 
+}
+
+void loop() {
+  // Generate random values between 0 and 255 for each color channel
+  int r = random(0, 256);
+  int g = random(0, 256);
+  int b = random(0, 256);
+
+  // Turn LED ON with the random color
+  pixels.setPixelColor(0, pixels.Color(r, g, b));
+  pixels.show(); 
+  delay(1000);
+
+  // Turn LED OFF
+  pixels.setPixelColor(0, pixels.Color(0, 0, 0));
+  pixels.show(); 
+  delay(500); // Shorter off delay makes the transitions feel snappier
+}
