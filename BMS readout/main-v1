@@ -1,0 +1,640 @@
+/*
+ * =============================================================================
+ *  DALY Smart BMS  ->  ESP32-C3  BLE Reader
+ * =============================================================================
+ *
+ *  Target unit (from field device):
+ *      BLE name : DL-1771060607EB
+ *      HW       : BMS-GD230-309E
+ *      SW       : 31_211225_LEDT
+ *
+ *  Reads: pack voltage, current (signed, regen = negative), SOC, remaining Ah,
+ *         per-cell voltages, temperatures, MOSFET states, balancing, cycles.
+ *
+ *  Board  : ESP32-C3 (any "C3 mini" / SuperMini / DevKitM-1)
+ *  Library: NimBLE-Arduino  >= 1.4.x   (Library Manager -> "NimBLE-Arduino")
+ *           NimBLE is used instead of Bluedroid: ~50% less flash/RAM, which
+ *           matters a lot on a C3.
+ *
+ *  Arduino IDE settings:
+ *      Board             : "ESP32C3 Dev Module"
+ *      USB CDC On Boot   : Enabled     <-- REQUIRED or Serial prints nothing
+ *      Partition Scheme  : Minimal SPIFFS (or any with >=1.9MB app)
+ *      Flash Size        : 4MB
+ *
+ *  PROTOCOL NOTE
+ *  -------------
+ *  DALY ships two incompatible protocols over the same BLE characteristics:
+ *      0xA5  - classic 13-byte fixed frames  (older J/T/A/U/W/ND + GD series)
+ *      0xD2  - Modbus-style                  (newer H/K/M/S series)
+ *  The GD230 hardware string suggests 0xA5, but this sketch PROBES BOTH on
+ *  connect and locks onto whichever answers. Watch the serial log line:
+ *      "[PROTO] detected: 0xA5"   or   "[PROTO] detected: 0xD2"
+ *
+ *  IMPORTANT: The BMS accepts ONE BLE central at a time. Close the DALY phone
+ *  app before running this, or the ESP32 will never connect.
+ *
+ * =============================================================================
+ */
+
+#include <NimBLEDevice.h>
+
+// ---------------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------------
+
+// Match by name prefix (robust) or exact name (faster, no ambiguity in a
+// depot full of bikes). For fleet deployment you should pin the exact MAC.
+static const char *TARGET_NAME_EXACT  = "DL-1771060607EB";
+static const char *TARGET_NAME_PREFIX = "DL-";
+static const bool  USE_EXACT_NAME     = true;
+
+static const uint32_t POLL_INTERVAL_MS = 2000;   // how often to refresh
+static const uint32_t SCAN_TIME_S      = 5;
+static const uint32_t STALE_TIMEOUT_MS = 15000;  // data older than this = bad
+
+#define MAX_CELLS 32
+#define MAX_TEMPS 8
+
+// GATT UUIDs — standard DALY BLE dongle
+static NimBLEUUID SVC_UUID ("0000fff0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID CHR_NOTIFY("0000fff1-0000-1000-8000-00805f9b34fb"); // BMS -> us
+static NimBLEUUID CHR_WRITE ("0000fff2-0000-1000-8000-00805f9b34fb"); // us -> BMS
+
+// ---------------------------------------------------------------------------
+// DATA MODEL  — this struct is what you hand to your MQTT publisher
+// ---------------------------------------------------------------------------
+
+struct DalyData {
+  // --- pack level ---
+  float    packVoltage   = 0;    // V
+  float    current       = 0;    // A, +charge / -discharge
+  float    soc           = 0;    // %
+  float    remainingAh   = 0;    // Ah
+  uint16_t cycles        = 0;
+
+  // --- cells ---
+  uint8_t  cellCount     = 0;
+  uint16_t cellmV[MAX_CELLS] = {0};
+  uint16_t maxCellmV     = 0;
+  uint16_t minCellmV     = 0;
+  uint8_t  maxCellNum    = 0;
+  uint8_t  minCellNum    = 0;
+
+  // --- thermal ---
+  uint8_t  tempCount     = 0;
+  int8_t   tempC[MAX_TEMPS] = {0};
+  int8_t   maxTempC      = 0;
+  int8_t   minTempC      = 0;
+
+  // --- states ---
+  bool     chgMos        = false;
+  bool     dsgMos        = false;
+  bool     balancing     = false;
+  uint8_t  chargeState   = 0;    // 0=idle 1=charging 2=discharging
+
+  // --- derived / meta ---
+  float    powerW        = 0;    // V * I  -> integrate for kWh
+  uint16_t cellDeltamV   = 0;    // max-min: the key pack-health number
+  bool     valid         = false;
+  uint32_t lastUpdateMs  = 0;
+};
+
+static DalyData g_bms;
+
+// ---------------------------------------------------------------------------
+// BLE STATE
+// ---------------------------------------------------------------------------
+
+enum Protocol : uint8_t { PROTO_UNKNOWN = 0, PROTO_A5 = 0xA5, PROTO_D2 = 0xD2 };
+static Protocol g_proto = PROTO_UNKNOWN;
+
+static NimBLEClient           *g_client   = nullptr;
+static NimBLERemoteCharacteristic *g_chrWrite = nullptr;
+static NimBLEAdvertisedDevice *g_target   = nullptr;
+
+static volatile bool g_doConnect   = false;
+static volatile bool g_connected   = false;
+
+// RX accumulator — BLE notifications fragment and coalesce frames arbitrarily,
+// so never assume "one notification == one frame".
+static uint8_t  g_rx[512];
+static size_t   g_rxLen = 0;
+
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+
+static uint16_t be16(const uint8_t *p) { return (uint16_t)p[0] << 8 | p[1]; }
+static uint32_t be32(const uint8_t *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+// Modbus CRC16 (for the 0xD2 protocol)
+static uint16_t crc16(const uint8_t *buf, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  }
+  return crc;
+}
+
+static void hexdump(const char *tag, const uint8_t *p, size_t n) {
+  Serial.printf("%s [%u] ", tag, (unsigned)n);
+  for (size_t i = 0; i < n; i++) Serial.printf("%02X ", p[i]);
+  Serial.println();
+}
+
+// ---------------------------------------------------------------------------
+// 0xA5 PROTOCOL  — fixed 13-byte frames
+//   [0]=0xA5 start
+//   [1]=addr (0x80 = "host/PC")
+//   [2]=command
+//   [3]=length (always 0x08)
+//   [4..11]=payload
+//   [12]=checksum = sum(bytes 0..11) & 0xFF
+// ---------------------------------------------------------------------------
+
+// Command set we actually use
+enum : uint8_t {
+  A5_SOC        = 0x90,  // voltage, current, SOC
+  A5_MINMAX_V   = 0x91,  // max/min cell voltage + index
+  A5_MINMAX_T   = 0x92,  // max/min temperature
+  A5_MOS        = 0x93,  // charge state, MOS states, remaining capacity
+  A5_STATUS     = 0x94,  // cell count, temp sensor count
+  A5_CELL_V     = 0x95,  // per-cell voltages (multi-frame)
+  A5_CELL_T     = 0x96,  // per-cell temps (multi-frame)
+  A5_BALANCE    = 0x97,  // balancer states
+};
+
+static void a5Send(uint8_t cmd) {
+  uint8_t f[13] = {0};
+  f[0] = 0xA5;
+  f[1] = 0x80;
+  f[2] = cmd;
+  f[3] = 0x08;
+  uint8_t cs = 0;
+  for (int i = 0; i < 12; i++) cs += f[i];
+  f[12] = cs;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 13, false);
+}
+
+// Parse one complete, checksum-verified 13-byte A5 frame
+static void a5Parse(const uint8_t *f) {
+  const uint8_t cmd = f[2];
+  const uint8_t *d  = &f[4];          // 8 payload bytes
+
+  switch (cmd) {
+
+    case A5_SOC: {
+      g_bms.packVoltage = be16(d + 0) * 0.1f;
+      // d+2 is "gather voltage" (secondary measurement) - ignored
+      // Current is offset-encoded: raw 30000 == 0 A, unit 0.1 A
+      g_bms.current     = ((int32_t)be16(d + 4) - 30000) * 0.1f;
+      g_bms.soc         = be16(d + 6) * 0.1f;
+      g_bms.powerW      = g_bms.packVoltage * g_bms.current;
+      g_bms.valid       = true;
+      g_bms.lastUpdateMs = millis();
+      break;
+    }
+
+    case A5_MINMAX_V: {
+      g_bms.maxCellmV  = be16(d + 0);
+      g_bms.maxCellNum = d[2];
+      g_bms.minCellmV  = be16(d + 3);
+      g_bms.minCellNum = d[5];
+      if (g_bms.maxCellmV >= g_bms.minCellmV)
+        g_bms.cellDeltamV = g_bms.maxCellmV - g_bms.minCellmV;
+      break;
+    }
+
+    case A5_MINMAX_T: {
+      // Temperatures are offset by 40 (i.e. raw 40 == 0 degC)
+      g_bms.maxTempC = (int16_t)d[0] - 40;
+      g_bms.minTempC = (int16_t)d[2] - 40;
+      break;
+    }
+
+    case A5_MOS: {
+      g_bms.chargeState = d[0];       // 0 idle, 1 charging, 2 discharging
+      g_bms.chgMos      = d[1];
+      g_bms.dsgMos      = d[2];
+      // d[3] = BMS life counter (rolls 0..255, useful as a liveness check)
+      g_bms.remainingAh = be32(d + 4) / 1000.0f;   // mAh -> Ah
+      break;
+    }
+
+    case A5_STATUS: {
+      if (d[0] > 0 && d[0] <= MAX_CELLS) g_bms.cellCount = d[0];
+      if (d[1] > 0 && d[1] <= MAX_TEMPS) g_bms.tempCount = d[1];
+      g_bms.cycles = be16(d + 5);
+      break;
+    }
+
+    case A5_CELL_V: {
+      // Multi-frame: d[0] = frame no (1-based), then 3 cells x 2 bytes (mV)
+      const uint8_t frame = d[0];
+      if (frame == 0 || frame > 11) break;
+      for (uint8_t i = 0; i < 3; i++) {
+        const uint8_t idx = (frame - 1) * 3 + i;
+        if (idx >= MAX_CELLS) break;
+        const uint16_t mv = be16(d + 1 + i * 2);
+        if (mv > 0 && mv < 5000) g_bms.cellmV[idx] = mv;
+      }
+      break;
+    }
+
+    case A5_CELL_T: {
+      // Multi-frame: d[0] = frame no, then 7 temps, offset 40
+      const uint8_t frame = d[0];
+      if (frame == 0) break;
+      for (uint8_t i = 0; i < 7; i++) {
+        const uint8_t idx = (frame - 1) * 7 + i;
+        if (idx >= MAX_TEMPS) break;
+        g_bms.tempC[idx] = (int16_t)d[1 + i] - 40;
+      }
+      break;
+    }
+
+    case A5_BALANCE: {
+      bool any = false;
+      for (uint8_t i = 0; i < 6 && !any; i++)
+        if (d[i]) any = true;
+      g_bms.balancing = any;
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// Pull complete A5 frames out of the RX accumulator
+static void a5Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 13) {
+    if (g_rx[i] != 0xA5) { i++; continue; }          // resync
+    uint8_t cs = 0;
+    for (int k = 0; k < 12; k++) cs += g_rx[i + k];
+    if (cs != g_rx[i + 12]) { i++; continue; }        // bad checksum, resync
+    a5Parse(&g_rx[i]);
+    i += 13;
+  }
+  // shift remainder down
+  if (i > 0) {
+    memmove(g_rx, g_rx + i, g_rxLen - i);
+    g_rxLen -= i;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 0xD2 PROTOCOL  — Modbus style (fallback if this BMS turns out to be newer)
+//   Request : D2 03 <startReg:2> <numRegs:2> <crc16:2>
+//   Response: D2 03 <byteCount> <data...> <crc16:2>
+// ---------------------------------------------------------------------------
+
+static void d2SendReadAll() {
+  // Read 0x3E (62) registers from 0x0000 — the standard "read everything" call
+  uint8_t f[8] = {0xD2, 0x03, 0x00, 0x00, 0x00, 0x3E, 0x00, 0x00};
+  const uint16_t c = crc16(f, 6);
+  f[6] = c & 0xFF;
+  f[7] = c >> 8;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 8, false);
+}
+
+static void d2Parse(const uint8_t *p, size_t n) {
+  // p[0]=0xD2 p[1]=0x03 p[2]=byteCount, data starts p[3]
+  const uint8_t bc = p[2];
+  if (n < (size_t)(3 + bc + 2)) return;
+  const uint8_t *d = p + 3;
+
+  // Registers are 16-bit big-endian. Layout for the D2 "read all" block:
+  //   reg 0..31  : cell voltages, mV
+  //   reg 32..39 : temperatures, offset 40
+  //   reg 40     : pack voltage,  0.1 V
+  //   reg 42     : current, offset 30000, 0.1 A
+  //   reg 43     : SOC, 0.1 %
+  auto reg = [&](uint8_t r) -> uint16_t { return be16(d + r * 2); };
+
+  uint8_t cells = 0;
+  for (uint8_t i = 0; i < 32; i++) {
+    const uint16_t mv = reg(i);
+    if (mv > 500 && mv < 5000) { g_bms.cellmV[i] = mv; cells = i + 1; }
+  }
+  if (cells) g_bms.cellCount = cells;
+
+  uint8_t temps = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    const int16_t t = (int16_t)reg(32 + i) - 40;
+    if (t > -40 && t < 125) { g_bms.tempC[i] = (int8_t)t; temps = i + 1; }
+  }
+  if (temps) g_bms.tempCount = temps;
+
+  g_bms.packVoltage = reg(40) * 0.1f;
+  g_bms.current     = ((int32_t)reg(42) - 30000) * 0.1f;
+  g_bms.soc         = reg(43) * 0.1f;
+  g_bms.powerW      = g_bms.packVoltage * g_bms.current;
+
+  // recompute min/max/delta locally
+  uint16_t mn = 0xFFFF, mx = 0;
+  uint8_t mni = 0, mxi = 0;
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    if (g_bms.cellmV[i] < mn) { mn = g_bms.cellmV[i]; mni = i + 1; }
+    if (g_bms.cellmV[i] > mx) { mx = g_bms.cellmV[i]; mxi = i + 1; }
+  }
+  if (g_bms.cellCount) {
+    g_bms.minCellmV = mn; g_bms.minCellNum = mni;
+    g_bms.maxCellmV = mx; g_bms.maxCellNum = mxi;
+    g_bms.cellDeltamV = mx - mn;
+  }
+
+  g_bms.valid = true;
+  g_bms.lastUpdateMs = millis();
+}
+
+static void d2Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 5) {
+    if (g_rx[i] != 0xD2 || g_rx[i + 1] != 0x03) { i++; continue; }
+    const uint8_t bc = g_rx[i + 2];
+    const size_t total = 3 + bc + 2;
+    if (g_rxLen - i < total) break;                  // wait for more bytes
+    const uint16_t got  = g_rx[i + total - 2] | (g_rx[i + total - 1] << 8);
+    const uint16_t want = crc16(&g_rx[i], total - 2);
+    if (got != want) { i++; continue; }
+    d2Parse(&g_rx[i], total);
+    i += total;
+  }
+  if (i > 0) {
+    memmove(g_rx, g_rx + i, g_rxLen - i);
+    g_rxLen -= i;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFY CALLBACK
+// ---------------------------------------------------------------------------
+
+static void onNotify(NimBLERemoteCharacteristic *chr,
+                     uint8_t *data, size_t len, bool isNotify) {
+  if (g_rxLen + len > sizeof(g_rx)) g_rxLen = 0;     // overflow guard
+  memcpy(g_rx + g_rxLen, data, len);
+  g_rxLen += len;
+
+  // Protocol auto-detect: whichever start byte shows up first wins.
+  if (g_proto == PROTO_UNKNOWN) {
+    for (size_t i = 0; i < g_rxLen; i++) {
+      if (g_rx[i] == 0xA5) { g_proto = PROTO_A5; break; }
+      if (g_rx[i] == 0xD2 && i + 1 < g_rxLen && g_rx[i + 1] == 0x03) {
+        g_proto = PROTO_D2; break;
+      }
+    }
+    if (g_proto != PROTO_UNKNOWN) {
+      Serial.printf("\n[PROTO] detected: 0x%02X\n", (uint8_t)g_proto);
+      hexdump("[PROTO] first bytes:", g_rx, g_rxLen);
+    }
+  }
+
+  if (g_proto == PROTO_A5) a5Consume();
+  else if (g_proto == PROTO_D2) d2Consume();
+}
+
+// ---------------------------------------------------------------------------
+// CLIENT CALLBACKS
+// ---------------------------------------------------------------------------
+
+class ClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *c) override {
+    Serial.println("[BLE] connected");
+    // Ask for a slow-ish interval: telemetry does not need 7.5ms latency,
+    // and a relaxed interval is far more robust on a noisy vehicle.
+    c->updateConnParams(24, 48, 0, 400);
+    g_connected = true;
+  }
+  void onDisconnect(NimBLEClient *c, int reason) override {
+    Serial.printf("[BLE] disconnected (reason %d)\n", reason);
+    g_connected  = false;
+    g_bms.valid  = false;
+    g_proto      = PROTO_UNKNOWN;
+    g_rxLen      = 0;
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+  }
+};
+static ClientCB g_clientCB;
+
+class ScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *dev) override {
+    if (!dev->haveName()) return;
+    const std::string n = dev->getName();
+
+    const bool hit = USE_EXACT_NAME
+        ? (n == TARGET_NAME_EXACT)
+        : (n.rfind(TARGET_NAME_PREFIX, 0) == 0);
+
+    if (!hit) return;
+
+    Serial.printf("[BLE] found %s  (%s)  RSSI %d\n",
+                  n.c_str(), dev->getAddress().toString().c_str(),
+                  dev->getRSSI());
+    NimBLEDevice::getScan()->stop();
+    g_target    = const_cast<NimBLEAdvertisedDevice *>(dev);
+    g_doConnect = true;
+  }
+};
+static ScanCB g_scanCB;
+
+// ---------------------------------------------------------------------------
+// CONNECT
+// ---------------------------------------------------------------------------
+
+static bool connectToBms() {
+  if (!g_client) {
+    g_client = NimBLEDevice::createClient();
+    g_client->setClientCallbacks(&g_clientCB, false);
+    g_client->setConnectTimeout(10 * 1000);
+  }
+
+  if (!g_client->connect(g_target)) {
+    Serial.println("[BLE] connect failed");
+    return false;
+  }
+
+  NimBLERemoteService *svc = g_client->getService(SVC_UUID);
+  if (!svc) {
+    Serial.println("[BLE] service FFF0 not found");
+    g_client->disconnect();
+    return false;
+  }
+
+  NimBLERemoteCharacteristic *notif = svc->getCharacteristic(CHR_NOTIFY);
+  g_chrWrite                        = svc->getCharacteristic(CHR_WRITE);
+
+  if (!notif || !g_chrWrite) {
+    Serial.println("[BLE] FFF1/FFF2 not found");
+    g_client->disconnect();
+    return false;
+  }
+
+  if (!notif->subscribe(true, onNotify)) {
+    Serial.println("[BLE] subscribe failed");
+    g_client->disconnect();
+    return false;
+  }
+
+  Serial.println("[BLE] subscribed to FFF1, probing protocol...");
+
+  // Probe: fire one of each and see who answers.
+  d2SendReadAll();
+  delay(400);
+  if (g_proto == PROTO_UNKNOWN) {
+    a5Send(A5_SOC);
+    delay(400);
+  }
+  if (g_proto == PROTO_UNKNOWN)
+    Serial.println("[PROTO] no reply yet - will keep trying in poll loop");
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// POLL
+// ---------------------------------------------------------------------------
+
+static void pollBms() {
+  if (g_proto == PROTO_D2) {
+    d2SendReadAll();                 // one call gets everything
+    return;
+  }
+
+  // 0xA5 (or still probing): request each block with a gap so replies do not
+  // stomp on each other.
+  const uint8_t cmds[] = {
+    A5_SOC, A5_MINMAX_V, A5_MINMAX_T, A5_MOS,
+    A5_STATUS, A5_CELL_V, A5_CELL_T, A5_BALANCE
+  };
+  for (uint8_t c : cmds) {
+    a5Send(c);
+    delay(60);                        // BMS needs breathing room between frames
+  }
+
+  if (g_proto == PROTO_UNKNOWN) d2SendReadAll();   // keep probing
+}
+
+// ---------------------------------------------------------------------------
+// OUTPUT
+// ---------------------------------------------------------------------------
+
+static void printHuman() {
+  Serial.println(F("\n---------------- DALY BMS ----------------"));
+  Serial.printf("Pack      : %.1f V   %.1f A   %.0f W\n",
+                g_bms.packVoltage, g_bms.current, g_bms.powerW);
+  Serial.printf("SOC       : %.1f %%   (%.1f Ah remaining)\n",
+                g_bms.soc, g_bms.remainingAh);
+  Serial.printf("Cells     : %u   delta %u mV   min #%u %u mV   max #%u %u mV\n",
+                g_bms.cellCount, g_bms.cellDeltamV,
+                g_bms.minCellNum, g_bms.minCellmV,
+                g_bms.maxCellNum, g_bms.maxCellmV);
+
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    Serial.printf("  C%-2u %4u mV%s", i + 1, g_bms.cellmV[i],
+                  ((i + 1) % 4 == 0) ? "\n" : "  ");
+  }
+  if (g_bms.cellCount % 4) Serial.println();
+
+  Serial.printf("Temps     : ");
+  for (uint8_t i = 0; i < g_bms.tempCount; i++)
+    Serial.printf("T%u=%d C  ", i + 1, g_bms.tempC[i]);
+  Serial.println();
+
+  const char *st = g_bms.chargeState == 1 ? "CHARGING"
+                 : g_bms.chargeState == 2 ? "DISCHARGING" : "IDLE";
+  Serial.printf("State     : %s   ChgMOS %s   DsgMOS %s   Balance %s\n",
+                st,
+                g_bms.chgMos ? "ON" : "OFF",
+                g_bms.dsgMos ? "ON" : "OFF",
+                g_bms.balancing ? "ON" : "OFF");
+  Serial.printf("Cycles    : %u\n", g_bms.cycles);
+  Serial.println(F("------------------------------------------"));
+}
+
+// This is the shape you will hand to MQTT. Keep it compact - you are paying
+// per byte over LTE across 100 bikes.
+static void printJson() {
+  Serial.print("{\"v\":");     Serial.print(g_bms.packVoltage, 1);
+  Serial.print(",\"i\":");     Serial.print(g_bms.current, 1);
+  Serial.print(",\"p\":");     Serial.print(g_bms.powerW, 0);
+  Serial.print(",\"soc\":");   Serial.print(g_bms.soc, 1);
+  Serial.print(",\"ah\":");    Serial.print(g_bms.remainingAh, 1);
+  Serial.print(",\"cyc\":");   Serial.print(g_bms.cycles);
+  Serial.print(",\"dmv\":");   Serial.print(g_bms.cellDeltamV);
+  Serial.print(",\"chg\":");   Serial.print(g_bms.chgMos ? 1 : 0);
+  Serial.print(",\"dsg\":");   Serial.print(g_bms.dsgMos ? 1 : 0);
+  Serial.print(",\"bal\":");   Serial.print(g_bms.balancing ? 1 : 0);
+
+  Serial.print(",\"t\":[");
+  for (uint8_t i = 0; i < g_bms.tempCount; i++) {
+    if (i) Serial.print(',');
+    Serial.print(g_bms.tempC[i]);
+  }
+  Serial.print("],\"c\":[");
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    if (i) Serial.print(',');
+    Serial.print(g_bms.cellmV[i]);
+  }
+  Serial.println("]}");
+}
+
+// ---------------------------------------------------------------------------
+// ARDUINO
+// ---------------------------------------------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);                       // give USB-CDC time to enumerate on C3
+  Serial.println(F("\n\n=== DALY BMS BLE reader (ESP32-C3) ==="));
+  Serial.printf("Target: %s\n\n",
+                USE_EXACT_NAME ? TARGET_NAME_EXACT : TARGET_NAME_PREFIX);
+
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);     // max TX: metal bike frame
+
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&g_scanCB, false);
+  scan->setActiveScan(true);                  // needed to receive the name
+  scan->setInterval(100);
+  scan->setWindow(80);
+  scan->start(SCAN_TIME_S, false);
+}
+
+void loop() {
+  static uint32_t lastPoll = 0;
+
+  if (g_doConnect) {
+    g_doConnect = false;
+    if (!connectToBms()) {
+      delay(2000);
+      NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+    }
+  }
+
+  if (g_connected && millis() - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    pollBms();
+
+    if (g_bms.valid && millis() - g_bms.lastUpdateMs < STALE_TIMEOUT_MS) {
+      printHuman();
+      printJson();
+    } else {
+      Serial.println("[WARN] no valid data (stale or not yet parsed)");
+    }
+  }
+
+  // Not connected and not scanning -> kick off another scan
+  if (!g_connected && !g_doConnect && !NimBLEDevice::getScan()->isScanning()) {
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+  }
+
+  delay(10);
+}
