@@ -1,0 +1,712 @@
+/*
+ * =============================================================================
+ *  DALY BMS -> ESP32-C3 -> LIVE MOBILE DASHBOARD   (v3)
+ * =============================================================================
+ *
+ *  Reads the DALY BMS over BLE and serves a live dashboard over WiFi.
+ *  Open it on your phone -- no app, no cloud, no internet needed.
+ *
+ *  USAGE
+ *  -----
+ *    1. Flash. 2. On your phone join WiFi:
+ *          SSID : EVBIKE-01
+ *          PASS : evbike1234
+ *       3. Open  http://192.168.4.1     (or http://evbike.local)
+ *
+ *  VALIDATED AGAINST HARDWARE
+ *  --------------------------
+ *      DL-1771060607EB / BMS-GD230-309E / 15S LiFePO4 ~60Ah / protocol 0xA5
+ *      Current sign CONFIRMED: negative = discharge, positive = charge.
+ *
+ *  v3 CHANGES over v2
+ *  ------------------
+ *    - FIX: min/max/delta now derived ONLY from the 0x95 cell sweep, so the
+ *           whole line is one coherent snapshot. (v2 mixed stale 0x91 data
+ *           with fresh sweep data and printed contradictory values.)
+ *    - Cell-delta health verdict is GATED ON |current| < 1.0 A. Under load a
+ *           healthy pack legitimately spreads to ~16 mV; judging health then
+ *           would false-alarm on every acceleration.
+ *    - WiFi AP + embedded responsive dashboard + JSON API at /api/data
+ *
+ *  RADIO NOTE
+ *  ----------
+ *  The C3 has ONE 2.4 GHz radio shared by WiFi and BLE. Coexistence works but
+ *  they time-slice, so expect occasional slower BLE polls while a phone is
+ *  connected. This is fine for a depot/bench dashboard. In the deployed fleet
+ *  node the uplink is CELLULAR (UART to the A7670G), so WiFi stays off and BLE
+ *  gets the radio to itself.
+ *
+ *  BOARD  : ESP32-C3
+ *  LIBS   : NimBLE-Arduino >= 1.4.x   (only external dep)
+ *  IDE    : Tools -> USB CDC On Boot -> Enabled
+ *           Tools -> Partition Scheme -> Huge APP  (dashboard + BLE + WiFi)
+ *  NOTE   : Close the DALY phone app. The BMS allows ONE BLE central.
+ *
+ * =============================================================================
+ */
+
+#include <NimBLEDevice.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
+// ---------------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------------
+#define BIKE_ID        "EVBIKE-01"
+#define AP_SSID        "EVBIKE-01"
+#define AP_PASS        "evbike1234"     // >= 8 chars
+#define MDNS_NAME      "evbike"         // -> http://evbike.local
+
+#define PACK_SERIES        15
+#define PACK_NOMINAL_AH    60.0f
+#define CELL_MAX_V         3.65f
+#define CELL_MIN_V         2.50f
+
+// Cell-delta thresholds (mV) -- ONLY evaluated at rest (|I| < REST_CURRENT_A)
+#define DELTA_WATCH_MV     20
+#define DELTA_INVESTIGATE  50
+#define DELTA_ALARM_MV     100
+#define REST_CURRENT_A     1.0f
+
+static const char *TARGET_NAME_EXACT  = "DL-1771060607EB";
+static const char *TARGET_NAME_PREFIX = "DL-";
+static const bool  USE_EXACT_NAME     = true;
+
+static const uint32_t POLL_INTERVAL_MS = 2000;
+static const uint32_t SCAN_TIME_S      = 5;
+static const uint32_t STALE_TIMEOUT_MS = 15000;
+
+#define MAX_CELLS 32
+#define MAX_TEMPS 8
+
+static NimBLEUUID SVC_UUID  ("0000fff0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID CHR_NOTIFY("0000fff1-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID CHR_WRITE ("0000fff2-0000-1000-8000-00805f9b34fb");
+
+// ---------------------------------------------------------------------------
+// DATA
+// ---------------------------------------------------------------------------
+struct DalyData {
+  float    packVoltage = 0, current = 0, powerW = 0, powerKW = 0;
+  float    soc = 0, remainingAh = 0;
+  uint16_t cycles = 0;
+  uint8_t  cellCount = 0;
+  uint16_t cellmV[MAX_CELLS] = {0};
+  uint16_t maxCellmV = 0, minCellmV = 0, avgCellmV = 0, cellDeltamV = 0;
+  uint8_t  maxCellNum = 0, minCellNum = 0;
+  uint8_t  tempCount = 0;
+  int8_t   tempC[MAX_TEMPS] = {0};
+  bool     chgMos = false, dsgMos = false, balancing = false;
+  uint8_t  chargeState = 0, bmsLife = 0;
+  uint8_t  faultBytes[7] = {0};
+  bool     anyFault = false;
+  double   kWhIn = 0, kWhOut = 0;
+  bool     valid = false;
+  uint32_t lastUpdateMs = 0;
+  int      rssi = 0;
+};
+static DalyData g_bms;
+
+enum Protocol : uint8_t { PROTO_UNKNOWN = 0, PROTO_A5 = 0xA5, PROTO_D2 = 0xD2 };
+static Protocol g_proto = PROTO_UNKNOWN;
+
+static NimBLEClient               *g_client   = nullptr;
+static NimBLERemoteCharacteristic *g_chrWrite = nullptr;
+static NimBLEAdvertisedDevice     *g_target   = nullptr;
+static volatile bool g_doConnect = false, g_connected = false;
+static uint8_t g_rx[512];
+static size_t  g_rxLen = 0;
+
+static WebServer server(80);
+
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+static uint16_t be16(const uint8_t *p) { return (uint16_t)p[0] << 8 | p[1]; }
+static uint32_t be32(const uint8_t *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static uint16_t crc16(const uint8_t *b, size_t n) {
+  uint16_t c = 0xFFFF;
+  for (size_t i = 0; i < n; i++) {
+    c ^= b[i];
+    for (uint8_t k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xA001 : c >> 1;
+  }
+  return c;
+}
+
+static const char *FAULT_NAMES[7][8] = {
+  {"Cell overvolt L1","Cell overvolt L2","Cell undervolt L1","Cell undervolt L2",
+   "Pack overvolt L1","Pack overvolt L2","Pack undervolt L1","Pack undervolt L2"},
+  {"Chg temp high L1","Chg temp high L2","Chg temp low L1","Chg temp low L2",
+   "Dsg temp high L1","Dsg temp high L2","Dsg temp low L1","Dsg temp low L2"},
+  {"Chg overcurrent L1","Chg overcurrent L2","Dsg overcurrent L1","Dsg overcurrent L2",
+   "SOC high L1","SOC high L2","SOC low L1","SOC low L2"},
+  {"Diff volt L1","Diff volt L2","Diff temp L1","Diff temp L2","-","-","-","-"},
+  {"Chg MOS temp high","Dsg MOS temp high","Chg MOS temp sensor fail",
+   "Dsg MOS temp sensor fail","Chg MOS adhesion fail","Dsg MOS adhesion fail",
+   "Chg MOS open fail","Dsg MOS open fail"},
+  {"AFE collect fail","Voltage collect drop","Cell temp sensor fail","EEPROM fail",
+   "RTC fail","Precharge fail","Comms fail","Internal comms fail"},
+  {"Current module fail","Pack volt detect fail","Short circuit protect fail",
+   "Low volt forbid charge","-","-","-","-"}
+};
+
+// Health verdict -- meaningful ONLY at rest. Under load a healthy pack spreads
+// (measured: 1-2 mV at rest vs 15-16 mV @ 7 A on this pack).
+static const char *deltaVerdict() {
+  if (fabsf(g_bms.current) > REST_CURRENT_A) return "UNDER LOAD";
+  const uint16_t d = g_bms.cellDeltamV;
+  if (d < DELTA_WATCH_MV)    return "HEALTHY";
+  if (d < DELTA_INVESTIGATE) return "WATCH";
+  if (d < DELTA_ALARM_MV)    return "INVESTIGATE";
+  return "ALARM";
+}
+
+// ---------------------------------------------------------------------------
+// 0xA5
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+  A5_SOC = 0x90, A5_MINMAX_V = 0x91, A5_MINMAX_T = 0x92, A5_MOS = 0x93,
+  A5_STATUS = 0x94, A5_CELL_V = 0x95, A5_CELL_T = 0x96,
+  A5_BALANCE = 0x97, A5_FAULTS = 0x98
+};
+
+static void a5Send(uint8_t cmd) {
+  uint8_t f[13] = {0};
+  f[0] = 0xA5; f[1] = 0x80; f[2] = cmd; f[3] = 0x08;
+  uint8_t cs = 0;
+  for (int i = 0; i < 12; i++) cs += f[i];
+  f[12] = cs;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 13, false);
+}
+
+// v3 FIX: single coherent snapshot. min/max/avg/delta all come from the same
+// 0x95 sweep -- never mixed with an older 0x91 reply.
+static void recomputeCellStats() {
+  if (!g_bms.cellCount) return;
+  uint32_t sum = 0;
+  uint16_t mn = 0xFFFF, mx = 0;
+  uint8_t mni = 0, mxi = 0, n = 0;
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    const uint16_t v = g_bms.cellmV[i];
+    if (!v) continue;
+    sum += v; n++;
+    if (v < mn) { mn = v; mni = i + 1; }
+    if (v > mx) { mx = v; mxi = i + 1; }
+  }
+  if (n != g_bms.cellCount) return;      // incomplete sweep -> keep old values
+  g_bms.avgCellmV   = sum / n;
+  g_bms.minCellmV   = mn; g_bms.minCellNum = mni;
+  g_bms.maxCellmV   = mx; g_bms.maxCellNum = mxi;
+  g_bms.cellDeltamV = mx - mn;
+}
+
+static void integrateEnergy() {
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (!lastMs) { lastMs = now; return; }
+  const uint32_t dt = now - lastMs;
+  lastMs = now;
+  if (dt > 30000) return;                // gap = BLE dropped; never interpolate
+  const double kwh = (g_bms.powerW / 1000.0) * (dt / 3600000.0);
+  if (g_bms.current > 0.1f)       g_bms.kWhIn  += kwh;
+  else if (g_bms.current < -0.1f) g_bms.kWhOut += -kwh;
+}
+
+static void a5Parse(const uint8_t *f) {
+  const uint8_t cmd = f[2];
+  const uint8_t *d = &f[4];
+  switch (cmd) {
+    case A5_SOC:
+      g_bms.packVoltage = be16(d) * 0.1f;
+      g_bms.current = ((int32_t)be16(d + 4) - 30000) * 0.1f;  // -ve = discharge
+      g_bms.soc     = be16(d + 6) * 0.1f;
+      g_bms.powerW  = g_bms.packVoltage * g_bms.current;
+      g_bms.powerKW = g_bms.powerW / 1000.0f;
+      integrateEnergy();
+      g_bms.valid = true;
+      g_bms.lastUpdateMs = millis();
+      break;
+    // 0x91 intentionally NOT used for min/max any more (see recomputeCellStats)
+    case A5_MINMAX_T:
+      break;
+    case A5_MOS:
+      g_bms.chargeState = d[0];
+      g_bms.chgMos = d[1];
+      g_bms.dsgMos = d[2];
+      g_bms.bmsLife = d[3];
+      g_bms.remainingAh = be32(d + 4) / 1000.0f;
+      break;
+    case A5_STATUS:
+      if (d[0] > 0 && d[0] <= MAX_CELLS) g_bms.cellCount = d[0];
+      if (d[1] > 0 && d[1] <= MAX_TEMPS) g_bms.tempCount = d[1];
+      g_bms.cycles = be16(d + 5);
+      break;
+    case A5_CELL_V: {
+      const uint8_t fr = d[0];
+      if (!fr || fr > 11) break;
+      for (uint8_t i = 0; i < 3; i++) {
+        const uint8_t idx = (fr - 1) * 3 + i;
+        if (idx >= MAX_CELLS) break;
+        const uint16_t mv = be16(d + 1 + i * 2);
+        if (mv > 0 && mv < 5000) g_bms.cellmV[idx] = mv;
+      }
+      if (g_bms.cellCount && fr >= (g_bms.cellCount + 2) / 3) recomputeCellStats();
+      break;
+    }
+    case A5_CELL_T: {
+      const uint8_t fr = d[0];
+      if (!fr) break;
+      for (uint8_t i = 0; i < 7; i++) {
+        const uint8_t idx = (fr - 1) * 7 + i;
+        if (idx >= MAX_TEMPS) break;
+        g_bms.tempC[idx] = (int16_t)d[1 + i] - 40;
+      }
+      break;
+    }
+    case A5_BALANCE: {
+      bool any = false;
+      for (uint8_t i = 0; i < 6 && !any; i++) if (d[i]) any = true;
+      g_bms.balancing = any;
+      break;
+    }
+    case A5_FAULTS: {
+      bool any = false;
+      for (uint8_t i = 0; i < 7; i++) { g_bms.faultBytes[i] = d[i]; if (d[i]) any = true; }
+      g_bms.anyFault = any;
+      break;
+    }
+    default: break;
+  }
+}
+
+static void a5Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 13) {
+    if (g_rx[i] != 0xA5) { i++; continue; }
+    uint8_t cs = 0;
+    for (int k = 0; k < 12; k++) cs += g_rx[i + k];
+    if (cs != g_rx[i + 12]) { i++; continue; }
+    a5Parse(&g_rx[i]);
+    i += 13;
+  }
+  if (i) { memmove(g_rx, g_rx + i, g_rxLen - i); g_rxLen -= i; }
+}
+
+// ---------------------------------------------------------------------------
+// 0xD2 fallback
+// ---------------------------------------------------------------------------
+static void d2SendReadAll() {
+  uint8_t f[8] = {0xD2, 0x03, 0x00, 0x00, 0x00, 0x3E, 0, 0};
+  const uint16_t c = crc16(f, 6);
+  f[6] = c & 0xFF; f[7] = c >> 8;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 8, false);
+}
+static void d2Parse(const uint8_t *p, size_t n) {
+  const uint8_t bc = p[2];
+  if (n < (size_t)(3 + bc + 2)) return;
+  const uint8_t *d = p + 3;
+  auto reg = [&](uint8_t r) { return be16(d + r * 2); };
+  uint8_t cells = 0;
+  for (uint8_t i = 0; i < 32; i++) {
+    const uint16_t mv = reg(i);
+    if (mv > 500 && mv < 5000) { g_bms.cellmV[i] = mv; cells = i + 1; }
+  }
+  if (cells) g_bms.cellCount = cells;
+  uint8_t temps = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    const int16_t t = (int16_t)reg(32 + i) - 40;
+    if (t > -40 && t < 125) { g_bms.tempC[i] = t; temps = i + 1; }
+  }
+  if (temps) g_bms.tempCount = temps;
+  g_bms.packVoltage = reg(40) * 0.1f;
+  g_bms.current = ((int32_t)reg(42) - 30000) * 0.1f;
+  g_bms.soc = reg(43) * 0.1f;
+  g_bms.powerW = g_bms.packVoltage * g_bms.current;
+  g_bms.powerKW = g_bms.powerW / 1000.0f;
+  recomputeCellStats();
+  integrateEnergy();
+  g_bms.valid = true;
+  g_bms.lastUpdateMs = millis();
+}
+static void d2Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 5) {
+    if (g_rx[i] != 0xD2 || g_rx[i + 1] != 0x03) { i++; continue; }
+    const size_t total = 3 + g_rx[i + 2] + 2;
+    if (g_rxLen - i < total) break;
+    const uint16_t got = g_rx[i + total - 2] | (g_rx[i + total - 1] << 8);
+    if (got != crc16(&g_rx[i], total - 2)) { i++; continue; }
+    d2Parse(&g_rx[i], total);
+    i += total;
+  }
+  if (i) { memmove(g_rx, g_rx + i, g_rxLen - i); g_rxLen -= i; }
+}
+
+// ---------------------------------------------------------------------------
+// BLE plumbing
+// ---------------------------------------------------------------------------
+static void onNotify(NimBLERemoteCharacteristic *c, uint8_t *data, size_t len, bool n) {
+  if (g_rxLen + len > sizeof(g_rx)) g_rxLen = 0;
+  memcpy(g_rx + g_rxLen, data, len);
+  g_rxLen += len;
+  if (g_proto == PROTO_UNKNOWN) {
+    for (size_t i = 0; i < g_rxLen; i++) {
+      if (g_rx[i] == 0xA5) { g_proto = PROTO_A5; break; }
+      if (g_rx[i] == 0xD2 && i + 1 < g_rxLen && g_rx[i + 1] == 0x03) { g_proto = PROTO_D2; break; }
+    }
+    if (g_proto != PROTO_UNKNOWN)
+      Serial.printf("\n[PROTO] detected: 0x%02X\n", (uint8_t)g_proto);
+  }
+  if (g_proto == PROTO_A5) a5Consume();
+  else if (g_proto == PROTO_D2) d2Consume();
+}
+
+class ClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *c) override {
+    Serial.println("[BLE] connected");
+    c->updateConnParams(24, 48, 0, 400);
+    g_connected = true;
+  }
+  void onDisconnect(NimBLEClient *c, int r) override {
+    Serial.printf("[BLE] disconnected (%d)\n", r);
+    g_connected = false; g_bms.valid = false;
+    g_proto = PROTO_UNKNOWN; g_rxLen = 0;
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+  }
+};
+static ClientCB g_clientCB;
+
+class ScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *d) override {
+    if (!d->haveName()) return;
+    const std::string n = d->getName();
+    const bool hit = USE_EXACT_NAME ? (n == TARGET_NAME_EXACT)
+                                    : (n.rfind(TARGET_NAME_PREFIX, 0) == 0);
+    if (!hit) return;
+    Serial.printf("[BLE] found %s RSSI %d\n", n.c_str(), d->getRSSI());
+    g_bms.rssi = d->getRSSI();
+    NimBLEDevice::getScan()->stop();
+    g_target = const_cast<NimBLEAdvertisedDevice *>(d);
+    g_doConnect = true;
+  }
+};
+static ScanCB g_scanCB;
+
+static bool connectToBms() {
+  if (!g_client) {
+    g_client = NimBLEDevice::createClient();
+    g_client->setClientCallbacks(&g_clientCB, false);
+    g_client->setConnectTimeout(10000);
+  }
+  if (!g_client->connect(g_target)) { Serial.println("[BLE] connect failed"); return false; }
+  NimBLERemoteService *svc = g_client->getService(SVC_UUID);
+  if (!svc) { g_client->disconnect(); return false; }
+  NimBLERemoteCharacteristic *nf = svc->getCharacteristic(CHR_NOTIFY);
+  g_chrWrite = svc->getCharacteristic(CHR_WRITE);
+  if (!nf || !g_chrWrite) { g_client->disconnect(); return false; }
+  if (!nf->subscribe(true, onNotify)) { g_client->disconnect(); return false; }
+  a5Send(A5_SOC); delay(400);
+  if (g_proto == PROTO_UNKNOWN) { d2SendReadAll(); delay(400); }
+  return true;
+}
+
+static void pollBms() {
+  if (g_proto == PROTO_D2) { d2SendReadAll(); return; }
+  static const uint8_t cmds[] = { A5_SOC, A5_MOS, A5_STATUS, A5_CELL_V,
+                                  A5_CELL_T, A5_BALANCE, A5_FAULTS };
+  for (uint8_t c : cmds) { a5Send(c); delay(50); server.handleClient(); }
+  if (g_proto == PROTO_UNKNOWN) d2SendReadAll();
+}
+
+// ---------------------------------------------------------------------------
+// JSON API
+// ---------------------------------------------------------------------------
+static void handleData() {
+  String j = "{";
+  j += "\"id\":\"" BIKE_ID "\"";
+  j += ",\"ok\":" + String(g_connected && g_bms.valid &&
+        (millis() - g_bms.lastUpdateMs < STALE_TIMEOUT_MS) ? 1 : 0);
+  j += ",\"rssi\":" + String(g_bms.rssi);
+  j += ",\"v\":" + String(g_bms.packVoltage, 1);
+  j += ",\"i\":" + String(g_bms.current, 1);
+  j += ",\"kw\":" + String(g_bms.powerKW, 3);
+  j += ",\"soc\":" + String(g_bms.soc, 1);
+  j += ",\"ah\":" + String(g_bms.remainingAh, 1);
+  j += ",\"ahn\":" + String(PACK_NOMINAL_AH, 0);
+  j += ",\"ein\":" + String((float)g_bms.kWhIn, 3);
+  j += ",\"eout\":" + String((float)g_bms.kWhOut, 3);
+  j += ",\"cyc\":" + String(g_bms.cycles);
+  j += ",\"ns\":" + String(g_bms.cellCount);
+  j += ",\"avg\":" + String(g_bms.avgCellmV);
+  j += ",\"dmv\":" + String(g_bms.cellDeltamV);
+  j += ",\"mn\":" + String(g_bms.minCellmV);
+  j += ",\"mni\":" + String(g_bms.minCellNum);
+  j += ",\"mx\":" + String(g_bms.maxCellmV);
+  j += ",\"mxi\":" + String(g_bms.maxCellNum);
+  j += ",\"hv\":\"" + String(deltaVerdict()) + "\"";
+  j += ",\"st\":" + String(g_bms.chargeState);
+  j += ",\"chg\":" + String(g_bms.chgMos ? 1 : 0);
+  j += ",\"dsg\":" + String(g_bms.dsgMos ? 1 : 0);
+  j += ",\"bal\":" + String(g_bms.balancing ? 1 : 0);
+  j += ",\"life\":" + String(g_bms.bmsLife);
+  j += ",\"up\":" + String(millis() / 1000);
+
+  j += ",\"t\":[";
+  for (uint8_t i = 0; i < g_bms.tempCount; i++) { if (i) j += ','; j += String(g_bms.tempC[i]); }
+  j += "],\"c\":[";
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) { if (i) j += ','; j += String(g_bms.cellmV[i]); }
+  j += "],\"f\":[";
+  bool first = true;
+  for (uint8_t b = 0; b < 7; b++)
+    for (uint8_t bit = 0; bit < 8; bit++)
+      if (g_bms.faultBytes[b] & (1 << bit)) {
+        if (!first) j += ',';
+        j += "\"" + String(FAULT_NAMES[b][bit]) + "\"";
+        first = false;
+      }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+// ---------------------------------------------------------------------------
+// DASHBOARD  (mobile-first, dark, no external assets -- works with no internet)
+// ---------------------------------------------------------------------------
+static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#080b10"><title>EV Bike · BMS</title><style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:#080b10;--card:#121821;--card2:#0e141c;--line:#1f2937;--tx:#e8eef7;--dim:#7d8da3;
+--ok:#00e08a;--warn:#ffb020;--bad:#ff4d5e;--acc:#38bdf8;--vio:#a78bfa}
+body{background:var(--bg);color:var(--tx);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+padding:14px;padding-bottom:40px;max-width:520px;margin:0 auto}
+.hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.hd h1{font-size:17px;font-weight:650;letter-spacing:-.2px}
+.hd .sub{font-size:11px;color:var(--dim);margin-top:2px;font-variant-numeric:tabular-nums}
+.pill{display:flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
+border-radius:999px;padding:5px 11px;font-size:11px;font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--bad)}
+.dot.on{background:var(--ok);box-shadow:0 0 0 0 rgba(0,224,138,.6);animation:p 2s infinite}
+@keyframes p{70%{box-shadow:0 0 0 7px rgba(0,224,138,0)}100%{box-shadow:0 0 0 0 rgba(0,224,138,0)}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:12px}
+.gauge{display:flex;flex-direction:column;align-items:center;padding:20px 16px 16px}
+.gwrap{position:relative;width:200px;height:200px}
+svg{transform:rotate(-90deg)}
+.gtx{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.gtx b{font-size:46px;font-weight:700;letter-spacing:-2px;font-variant-numeric:tabular-nums;line-height:1}
+.gtx small{font-size:11px;color:var(--dim);letter-spacing:2.5px;margin-top:6px;text-transform:uppercase}
+.state{margin-top:14px;font-size:12px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;
+padding:6px 16px;border-radius:999px;background:var(--card2);border:1px solid var(--line)}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.g2{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 12px;text-align:center}
+.tile .k{font-size:10px;color:var(--dim);letter-spacing:1.1px;text-transform:uppercase;margin-bottom:5px}
+.tile .val{font-size:21px;font-weight:680;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.tile .u{font-size:11px;color:var(--dim);font-weight:500;margin-left:1px}
+.ttl{font-size:11px;color:var(--dim);letter-spacing:1.3px;text-transform:uppercase;
+margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.badge{font-size:10px;font-weight:700;padding:3px 9px;border-radius:6px;letter-spacing:.6px}
+.cells{display:flex;flex-direction:column;gap:5px}
+.cell{display:flex;align-items:center;gap:9px;font-size:11px}
+.cell .n{width:24px;color:var(--dim);font-variant-numeric:tabular-nums;flex:none}
+.bar{flex:1;height:16px;background:var(--card2);border-radius:5px;overflow:hidden;position:relative}
+.fill{height:100%;border-radius:5px;background:linear-gradient(90deg,#0e7490,#38bdf8);
+transition:width .45s cubic-bezier(.4,0,.2,1)}
+.fill.hi{background:linear-gradient(90deg,#a16207,#fbbf24)}
+.fill.lo{background:linear-gradient(90deg,#7f1d1d,#f87171)}
+.cell .mv{width:52px;text-align:right;font-variant-numeric:tabular-nums;font-weight:600;flex:none}
+.mos{display:flex;gap:8px;flex-wrap:wrap}
+.m{flex:1;min-width:82px;text-align:center;padding:9px 6px;border-radius:10px;background:var(--card2);
+border:1px solid var(--line);font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:var(--dim)}
+.m b{display:block;font-size:13px;margin-top:3px;letter-spacing:0}
+.flt{background:rgba(255,77,94,.09);border-color:rgba(255,77,94,.35)}
+.flt div{color:var(--bad);font-size:12px;padding:3px 0;font-weight:600}
+.ft{text-align:center;color:var(--dim);font-size:10px;margin-top:16px;font-variant-numeric:tabular-nums}
+.off{opacity:.4;filter:saturate(.3);transition:.3s}
+</style></head><body>
+
+<div class="hd"><div><h1 id="bid">EV Bike</h1><div class="sub" id="sub">connecting…</div></div>
+<div class="pill"><span class="dot" id="dot"></span><span id="lnk">OFFLINE</span></div></div>
+
+<div id="wrap">
+<div class="card gauge"><div class="gwrap">
+<svg width="200" height="200" viewBox="0 0 200 200">
+<circle cx="100" cy="100" r="86" fill="none" stroke="#182130" stroke-width="15"/>
+<circle id="arc" cx="100" cy="100" r="86" fill="none" stroke="var(--ok)" stroke-width="15"
+stroke-linecap="round" stroke-dasharray="540.4" stroke-dashoffset="540.4"
+style="transition:stroke-dashoffset .7s cubic-bezier(.4,0,.2,1),stroke .4s"/></svg>
+<div class="gtx"><b id="soc">--</b><small>State of charge</small></div></div>
+<div class="state" id="st">—</div></div>
+
+<div class="g3">
+<div class="tile"><div class="k">Voltage</div><div class="val"><span id="v">--</span><span class="u">V</span></div></div>
+<div class="tile"><div class="k">Current</div><div class="val"><span id="i">--</span><span class="u">A</span></div></div>
+<div class="tile"><div class="k">Power</div><div class="val"><span id="kw">--</span><span class="u">kW</span></div></div>
+</div>
+
+<div class="g3">
+<div class="tile"><div class="k">Remaining</div><div class="val"><span id="ah">--</span><span class="u">Ah</span></div></div>
+<div class="tile"><div class="k">Temp</div><div class="val"><span id="tp">--</span><span class="u">°C</span></div></div>
+<div class="tile"><div class="k">Cycles</div><div class="val" id="cyc">--</div></div>
+</div>
+
+<div class="g2">
+<div class="tile"><div class="k">Energy out</div><div class="val"><span id="eo">--</span><span class="u">kWh</span></div></div>
+<div class="tile"><div class="k">Energy in</div><div class="val"><span id="ei">--</span><span class="u">kWh</span></div></div>
+</div>
+
+<div class="card" id="fc" style="display:none">
+<div class="ttl">Active faults</div><div class="flt" id="fl"></div></div>
+
+<div class="card"><div class="ttl"><span>Cell balance</span>
+<span class="badge" id="hb">—</span></div>
+<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--dim);margin-bottom:12px">
+<span>min <b id="mn" style="color:var(--tx)">--</b> mV <span id="mni"></span></span>
+<span>Δ <b id="dmv" style="color:var(--tx)">--</b> mV</span>
+<span>max <b id="mx" style="color:var(--tx)">--</b> mV <span id="mxi"></span></span></div>
+<div class="cells" id="cl"></div></div>
+
+<div class="card"><div class="ttl">Status</div><div class="mos">
+<div class="m">Chg MOS<b id="cm">—</b></div>
+<div class="m">Dsg MOS<b id="dm">—</b></div>
+<div class="m">Balance<b id="bl">—</b></div>
+<div class="m">BMS life<b id="lf">—</b></div></div></div>
+
+<div class="ft" id="ft">—</div>
+</div>
+
+<script>
+const $=i=>document.getElementById(i);
+const C=540.4; let miss=0;
+
+function paint(d){
+ $('bid').textContent=d.id;
+ $('sub').textContent=d.ns+'S LiFePO4 · '+d.ahn+' Ah · '+d.rssi+' dBm';
+ const on=d.ok==1;
+ $('dot').className='dot'+(on?' on':'');
+ $('lnk').textContent=on?'LIVE':'NO DATA';
+ $('wrap').className=on?'':'off';
+
+ const soc=d.soc;
+ $('soc').textContent=soc.toFixed(1);
+ $('arc').style.strokeDashoffset=C-(C*Math.min(soc,100)/100);
+ $('arc').style.stroke=soc>50?'var(--ok)':soc>20?'var(--warn)':'var(--bad)';
+
+ const S=['IDLE','CHARGING','DISCHARGING'][d.st]||'IDLE';
+ $('st').textContent=S;
+ $('st').style.color=d.st==1?'var(--ok)':d.st==2?'var(--acc)':'var(--dim)';
+
+ $('v').textContent=d.v.toFixed(1);
+ $('i').textContent=d.i.toFixed(1);
+ $('i').style.color=d.i<-.1?'var(--acc)':d.i>.1?'var(--ok)':'var(--tx)';
+ $('kw').textContent=Math.abs(d.kw).toFixed(2);
+ $('ah').textContent=d.ah.toFixed(1);
+ $('tp').textContent=d.t.length?d.t[0]:'--';
+ $('cyc').textContent=d.cyc;
+ $('eo').textContent=d.eout.toFixed(3);
+ $('ei').textContent=d.ein.toFixed(3);
+
+ $('mn').textContent=d.mn; $('mni').textContent='#'+d.mni;
+ $('mx').textContent=d.mx; $('mxi').textContent='#'+d.mxi;
+ $('dmv').textContent=d.dmv;
+
+ const hb=$('hb'); hb.textContent=d.hv;
+ const col={'HEALTHY':'--ok','WATCH':'--warn','INVESTIGATE':'--warn','ALARM':'--bad','UNDER LOAD':'--vio'}[d.hv]||'--dim';
+ hb.style.background='color-mix(in srgb,var('+col+') 16%,transparent)';
+ hb.style.color='var('+col+')';
+
+ // Scale bars across the live min/max window so single-mV spread is visible.
+ // A 2.5-4.0V absolute scale would render 15 identical bars.
+ const lo=d.mn-3, hi=d.mx+3, sp=Math.max(hi-lo,1);
+ let h='';
+ d.c.forEach((mv,k)=>{
+   const w=Math.max(3,Math.min(100,(mv-lo)/sp*100));
+   const cls=(k+1)==d.mxi?'fill hi':(k+1)==d.mni?'fill lo':'fill';
+   h+='<div class="cell"><span class="n">'+(k+1)+'</span><div class="bar">'+
+      '<div class="'+cls+'" style="width:'+w+'%"></div></div>'+
+      '<span class="mv">'+mv+'</span></div>';
+ });
+ $('cl').innerHTML=h;
+
+ const set=(id,on)=>{const e=$(id);e.textContent=on?'ON':'OFF';
+   e.style.color=on?'var(--ok)':'var(--dim)';};
+ set('cm',d.chg); set('dm',d.dsg);
+ $('bl').textContent=d.bal?'ON':'OFF';
+ $('bl').style.color=d.bal?'var(--warn)':'var(--dim)';
+ $('lf').textContent=d.life;
+ $('lf').style.color='var(--tx)';
+
+ if(d.f.length){$('fc').style.display='block';
+   $('fl').innerHTML=d.f.map(x=>'<div>▲ '+x+'</div>').join('');}
+ else $('fc').style.display='none';
+
+ const u=d.up,hh=(u/3600|0),mm=(u%3600/60|0);
+ $('ft').textContent='avg cell '+d.avg+' mV · uptime '+hh+'h '+mm+'m';
+}
+
+async function tick(){
+ try{
+  const r=await fetch('/api/data',{cache:'no-store'});
+  paint(await r.json()); miss=0;
+ }catch(e){
+  if(++miss>3){$('dot').className='dot';$('lnk').textContent='NO LINK';
+   $('wrap').className='off';}
+ }
+}
+tick(); setInterval(tick,1000);
+</script></body></html>)HTML";
+
+static void handleRoot() { server.send_P(200, "text/html", PAGE); }
+
+// ---------------------------------------------------------------------------
+// SETUP / LOOP
+// ---------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  const uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) delay(10);
+  delay(300);
+#if !ARDUINO_USB_CDC_ON_BOOT
+  #warning "USB CDC On Boot is DISABLED - Serial will not appear on the USB port!"
+#endif
+
+  Serial.println(F("\n\n=== DALY BMS dashboard v3 (ESP32-C3) ==="));
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.printf("WiFi AP  : %s / %s\n", AP_SSID, AP_PASS);
+  Serial.printf("Dashboard: http://%s\n", WiFi.softAPIP().toString().c_str());
+  if (MDNS.begin(MDNS_NAME)) Serial.printf("      or : http://%s.local\n", MDNS_NAME);
+
+  server.on("/", handleRoot);
+  server.on("/api/data", handleData);
+  server.begin();
+
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEScan *s = NimBLEDevice::getScan();
+  s->setScanCallbacks(&g_scanCB, false);
+  s->setActiveScan(true);
+  s->setInterval(100);
+  s->setWindow(80);
+  s->start(SCAN_TIME_S, false);
+  Serial.println("Scanning for BMS...\n");
+}
+
+void loop() {
+  server.handleClient();                  // keep the UI responsive
+
+  static uint32_t lastPoll = 0;
+  if (g_doConnect) {
+    g_doConnect = false;
+    if (!connectToBms()) { delay(1500); NimBLEDevice::getScan()->start(SCAN_TIME_S, false); }
+  }
+  if (g_connected && millis() - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    pollBms();
+  }
+  if (!g_connected && !g_doConnect && !NimBLEDevice::getScan()->isScanning())
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+}
