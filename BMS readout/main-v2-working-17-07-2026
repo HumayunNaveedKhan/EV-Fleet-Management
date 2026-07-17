@@ -1,0 +1,666 @@
+/*
+ * =============================================================================
+ *  DALY Smart BMS  ->  ESP32-C3  BLE Reader   (v2)
+ * =============================================================================
+ *
+ *  CONFIRMED TARGET HARDWARE (validated against DALY app screenshots):
+ *      BLE name        : DL-1771060607EB
+ *      HW version      : BMS-GD230-309E
+ *      SW version      : 31_211225_LEDT
+ *      Topology        : 15S LiFePO4  (48V nominal / 54.75V full)
+ *      Nominal capacity: ~60 Ah  (53.5 Ah @ 89.3% SOC)  = ~2.88 kWh
+ *      Temp sensors    : 1  (T1)
+ *      Protocol        : 0xA5 classic frames (auto-detected, D2 fallback kept)
+ *
+ *  v2 adds over v1:
+ *      - 0x98 fault-flag decode  -> maps to app's "Status information"
+ *      - average cell voltage    -> maps to app's "Average volt"
+ *      - power in kW             -> maps to app's "Power KW"
+ *      - kWh integrator (energy in / out) for billing
+ *      - pack sanity validation against configured topology
+ *      - BMS liveness counter (detects hung BMS vs dropped BLE)
+ *
+ *  VERIFICATION TARGET — with the pack at rest your output should read:
+ *      Pack 49.9 V | 0.0 A | SOC 89.3 % | 53.5 Ah | Cells 15 | delta 2 mV
+ *      min #1 3329 mV | max #3 3331 mV | avg 3326 mV | T1 35 C | cycles 25
+ *  If those match the app byte-for-byte, your decoder is ground-truth validated.
+ *
+ *  Board  : ESP32-C3
+ *  Library: NimBLE-Arduino >= 1.4.x
+ *  IDE    : Tools -> USB CDC On Boot -> ENABLED  (else Serial prints nothing)
+ *  NOTE   : Close the DALY phone app first. The BMS allows ONE BLE central.
+ *
+ * =============================================================================
+ */
+
+#include <NimBLEDevice.h>
+
+// ---------------------------------------------------------------------------
+// PACK CONFIG  — per-bike. Move to NVS/flash config for fleet deployment.
+// ---------------------------------------------------------------------------
+#define PACK_SERIES        15        // confirmed: "Battery strings 15"
+#define PACK_NOMINAL_AH    60.0f     // derived: 53.5 Ah / 0.893
+#define CELL_NOMINAL_V     3.2f
+#define CELL_MAX_V         3.65f
+#define CELL_MIN_V         2.50f
+
+// Cell-delta health thresholds (mV) — baseline this pack measured 2 mV @ 25 cyc
+#define DELTA_WATCH_MV     20
+#define DELTA_INVESTIGATE  50
+#define DELTA_ALARM_MV     100
+
+// ---------------------------------------------------------------------------
+// CONNECTION CONFIG
+// ---------------------------------------------------------------------------
+static const char *TARGET_NAME_EXACT  = "DL-1771060607EB";
+static const char *TARGET_NAME_PREFIX = "DL-";
+static const bool  USE_EXACT_NAME     = true;   // false = first DL-* seen
+
+static const uint32_t POLL_INTERVAL_MS = 2000;
+static const uint32_t SCAN_TIME_S      = 5;
+static const uint32_t STALE_TIMEOUT_MS = 15000;
+
+#define MAX_CELLS 32
+#define MAX_TEMPS 8
+
+static NimBLEUUID SVC_UUID  ("0000fff0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID CHR_NOTIFY("0000fff1-0000-1000-8000-00805f9b34fb"); // BMS -> us
+static NimBLEUUID CHR_WRITE ("0000fff2-0000-1000-8000-00805f9b34fb"); // us -> BMS
+
+// ---------------------------------------------------------------------------
+// DATA MODEL
+// ---------------------------------------------------------------------------
+struct DalyData {
+  // pack
+  float    packVoltage  = 0;     // V
+  float    current      = 0;     // A   (+charge / -discharge)
+  float    powerW       = 0;     // W
+  float    powerKW      = 0;     // kW  -> app "Power KW"
+  float    soc          = 0;     // %
+  float    remainingAh  = 0;     // Ah
+  uint16_t cycles       = 0;
+
+  // cells
+  uint8_t  cellCount    = 0;
+  uint16_t cellmV[MAX_CELLS] = {0};
+  uint16_t maxCellmV    = 0;
+  uint16_t minCellmV    = 0;
+  uint16_t avgCellmV    = 0;     // -> app "Average volt"
+  uint8_t  maxCellNum   = 0;
+  uint8_t  minCellNum   = 0;
+  uint16_t cellDeltamV  = 0;     // -> app "voltage difference"
+
+  // thermal
+  uint8_t  tempCount    = 0;
+  int8_t   tempC[MAX_TEMPS] = {0};
+  int8_t   maxTempC     = 0;
+  int8_t   minTempC     = 0;
+
+  // states
+  bool     chgMos       = false;
+  bool     dsgMos       = false;
+  bool     balancing    = false;
+  uint8_t  chargeState  = 0;     // 0 idle / 1 charging / 2 discharging
+  uint8_t  bmsLife      = 0;     // rolls 0..255 each poll = liveness proof
+
+  // faults  -> app "Status information"
+  uint8_t  faultBytes[7] = {0};
+  bool     anyFault     = false;
+
+  // energy
+  double   kWhIn        = 0;     // cumulative charged
+  double   kWhOut       = 0;     // cumulative discharged
+
+  // meta
+  bool     valid        = false;
+  uint32_t lastUpdateMs = 0;
+};
+
+static DalyData g_bms;
+
+// ---------------------------------------------------------------------------
+// BLE STATE
+// ---------------------------------------------------------------------------
+enum Protocol : uint8_t { PROTO_UNKNOWN = 0, PROTO_A5 = 0xA5, PROTO_D2 = 0xD2 };
+static Protocol g_proto = PROTO_UNKNOWN;
+
+static NimBLEClient               *g_client   = nullptr;
+static NimBLERemoteCharacteristic *g_chrWrite = nullptr;
+static NimBLEAdvertisedDevice     *g_target   = nullptr;
+
+static volatile bool g_doConnect = false;
+static volatile bool g_connected = false;
+
+static uint8_t g_rx[512];
+static size_t  g_rxLen = 0;
+
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+static uint16_t be16(const uint8_t *p) { return (uint16_t)p[0] << 8 | p[1]; }
+static uint32_t be32(const uint8_t *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static uint16_t crc16(const uint8_t *buf, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+  }
+  return crc;
+}
+
+static void hexdump(const char *tag, const uint8_t *p, size_t n) {
+  Serial.printf("%s [%u] ", tag, (unsigned)n);
+  for (size_t i = 0; i < n; i++) Serial.printf("%02X ", p[i]);
+  Serial.println();
+}
+
+// ---------------------------------------------------------------------------
+// FAULT FLAG NAMES  (0x98) — 7 bytes x 8 bits
+// ---------------------------------------------------------------------------
+static const char *FAULT_NAMES[7][8] = {
+  {"Cell overvolt L1","Cell overvolt L2","Cell undervolt L1","Cell undervolt L2",
+   "Pack overvolt L1","Pack overvolt L2","Pack undervolt L1","Pack undervolt L2"},
+  {"Chg temp high L1","Chg temp high L2","Chg temp low L1","Chg temp low L2",
+   "Dsg temp high L1","Dsg temp high L2","Dsg temp low L1","Dsg temp low L2"},
+  {"Chg overcurrent L1","Chg overcurrent L2","Dsg overcurrent L1","Dsg overcurrent L2",
+   "SOC high L1","SOC high L2","SOC low L1","SOC low L2"},
+  {"Diff volt L1","Diff volt L2","Diff temp L1","Diff temp L2",
+   "-","-","-","-"},
+  {"Chg MOS temp high","Dsg MOS temp high","Chg MOS temp sensor fail",
+   "Dsg MOS temp sensor fail","Chg MOS adhesion fail","Dsg MOS adhesion fail",
+   "Chg MOS open fail","Dsg MOS open fail"},
+  {"AFE collect fail","Voltage collect drop","Cell temp sensor fail",
+   "EEPROM fail","RTC fail","Precharge fail","Comms fail","Internal comms fail"},
+  {"Current module fail","Pack volt detect fail","Short circuit protect fail",
+   "Low volt forbid charge","-","-","-","-"}
+};
+
+// ---------------------------------------------------------------------------
+// 0xA5 PROTOCOL
+//   [0]=0xA5 [1]=0x80 addr [2]=cmd [3]=0x08 len [4..11]=payload [12]=checksum
+// ---------------------------------------------------------------------------
+enum : uint8_t {
+  A5_SOC      = 0x90,
+  A5_MINMAX_V = 0x91,
+  A5_MINMAX_T = 0x92,
+  A5_MOS      = 0x93,
+  A5_STATUS   = 0x94,
+  A5_CELL_V   = 0x95,
+  A5_CELL_T   = 0x96,
+  A5_BALANCE  = 0x97,
+  A5_FAULTS   = 0x98,
+};
+
+static void a5Send(uint8_t cmd) {
+  uint8_t f[13] = {0};
+  f[0] = 0xA5; f[1] = 0x80; f[2] = cmd; f[3] = 0x08;
+  uint8_t cs = 0;
+  for (int i = 0; i < 12; i++) cs += f[i];
+  f[12] = cs;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 13, false);
+}
+
+// Recompute cell statistics after a full 0x95 sweep
+static void recomputeCellStats() {
+  if (!g_bms.cellCount) return;
+  uint32_t sum = 0;
+  uint16_t mn = 0xFFFF, mx = 0;
+  uint8_t  mni = 0, mxi = 0;
+  uint8_t  n = 0;
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    const uint16_t v = g_bms.cellmV[i];
+    if (!v) continue;
+    sum += v; n++;
+    if (v < mn) { mn = v; mni = i + 1; }
+    if (v > mx) { mx = v; mxi = i + 1; }
+  }
+  if (!n) return;
+  g_bms.avgCellmV = sum / n;
+  // Only override 0x91's values if we have the full set
+  if (n == g_bms.cellCount) {
+    g_bms.minCellmV = mn; g_bms.minCellNum = mni;
+    g_bms.maxCellmV = mx; g_bms.maxCellNum = mxi;
+    g_bms.cellDeltamV = mx - mn;
+  }
+}
+
+// Integrate energy. Called once per poll on fresh 0x90 data.
+static void integrateEnergy() {
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (lastMs == 0) { lastMs = now; return; }
+
+  uint32_t dt = now - lastMs;
+  lastMs = now;
+  if (dt > 30000) return;                 // gap too big (BLE dropped) - skip
+
+  const double hours = dt / 3600000.0;
+  const double kwh   = (g_bms.powerW / 1000.0) * hours;
+
+  if (g_bms.current > 0.1f)       g_bms.kWhIn  += kwh;
+  else if (g_bms.current < -0.1f) g_bms.kWhOut += -kwh;
+}
+
+static void a5Parse(const uint8_t *f) {
+  const uint8_t cmd = f[2];
+  const uint8_t *d  = &f[4];
+
+  switch (cmd) {
+
+    case A5_SOC:
+      g_bms.packVoltage = be16(d + 0) * 0.1f;
+      // Current is offset-encoded: raw 30000 == 0 A, unit 0.1 A.
+      // NEGATIVE = discharge. Verify under throttle before trusting kWh!
+      g_bms.current  = ((int32_t)be16(d + 4) - 30000) * 0.1f;
+      g_bms.soc      = be16(d + 6) * 0.1f;
+      g_bms.powerW   = g_bms.packVoltage * g_bms.current;
+      g_bms.powerKW  = g_bms.powerW / 1000.0f;
+      integrateEnergy();
+      g_bms.valid    = true;
+      g_bms.lastUpdateMs = millis();
+      break;
+
+    case A5_MINMAX_V:
+      g_bms.maxCellmV  = be16(d + 0);
+      g_bms.maxCellNum = d[2];
+      g_bms.minCellmV  = be16(d + 3);
+      g_bms.minCellNum = d[5];
+      if (g_bms.maxCellmV >= g_bms.minCellmV)
+        g_bms.cellDeltamV = g_bms.maxCellmV - g_bms.minCellmV;
+      break;
+
+    case A5_MINMAX_T:
+      g_bms.maxTempC = (int16_t)d[0] - 40;   // temps offset by 40
+      g_bms.minTempC = (int16_t)d[2] - 40;
+      break;
+
+    case A5_MOS:
+      g_bms.chargeState = d[0];
+      g_bms.chgMos      = d[1];
+      g_bms.dsgMos      = d[2];
+      g_bms.bmsLife     = d[3];
+      g_bms.remainingAh = be32(d + 4) / 1000.0f;   // mAh -> Ah
+      break;
+
+    case A5_STATUS:
+      if (d[0] > 0 && d[0] <= MAX_CELLS) g_bms.cellCount = d[0];
+      if (d[1] > 0 && d[1] <= MAX_TEMPS) g_bms.tempCount = d[1];
+      g_bms.cycles = be16(d + 5);
+      break;
+
+    case A5_CELL_V: {
+      const uint8_t frame = d[0];            // 1-based, 3 cells per frame
+      if (frame == 0 || frame > 11) break;
+      for (uint8_t i = 0; i < 3; i++) {
+        const uint8_t idx = (frame - 1) * 3 + i;
+        if (idx >= MAX_CELLS) break;
+        const uint16_t mv = be16(d + 1 + i * 2);
+        if (mv > 0 && mv < 5000) g_bms.cellmV[idx] = mv;
+      }
+      // 15S -> 5 frames of 3; recompute once the last frame lands
+      if (g_bms.cellCount && frame >= (g_bms.cellCount + 2) / 3)
+        recomputeCellStats();
+      break;
+    }
+
+    case A5_CELL_T: {
+      const uint8_t frame = d[0];            // 7 temps per frame, offset 40
+      if (frame == 0) break;
+      for (uint8_t i = 0; i < 7; i++) {
+        const uint8_t idx = (frame - 1) * 7 + i;
+        if (idx >= MAX_TEMPS) break;
+        g_bms.tempC[idx] = (int16_t)d[1 + i] - 40;
+      }
+      break;
+    }
+
+    case A5_BALANCE: {
+      bool any = false;
+      for (uint8_t i = 0; i < 6 && !any; i++) if (d[i]) any = true;
+      g_bms.balancing = any;
+      break;
+    }
+
+    case A5_FAULTS: {
+      bool any = false;
+      for (uint8_t i = 0; i < 7; i++) {
+        g_bms.faultBytes[i] = d[i];
+        if (d[i]) any = true;
+      }
+      g_bms.anyFault = any;
+      break;
+    }
+
+    default: break;
+  }
+}
+
+static void a5Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 13) {
+    if (g_rx[i] != 0xA5) { i++; continue; }
+    uint8_t cs = 0;
+    for (int k = 0; k < 12; k++) cs += g_rx[i + k];
+    if (cs != g_rx[i + 12]) { i++; continue; }
+    a5Parse(&g_rx[i]);
+    i += 13;
+  }
+  if (i > 0) { memmove(g_rx, g_rx + i, g_rxLen - i); g_rxLen -= i; }
+}
+
+// ---------------------------------------------------------------------------
+// 0xD2 FALLBACK (kept in case a newer BMS appears in the fleet)
+// ---------------------------------------------------------------------------
+static void d2SendReadAll() {
+  uint8_t f[8] = {0xD2, 0x03, 0x00, 0x00, 0x00, 0x3E, 0x00, 0x00};
+  const uint16_t c = crc16(f, 6);
+  f[6] = c & 0xFF; f[7] = c >> 8;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 8, false);
+}
+
+static void d2Parse(const uint8_t *p, size_t n) {
+  const uint8_t bc = p[2];
+  if (n < (size_t)(3 + bc + 2)) return;
+  const uint8_t *d = p + 3;
+  auto reg = [&](uint8_t r) -> uint16_t { return be16(d + r * 2); };
+
+  uint8_t cells = 0;
+  for (uint8_t i = 0; i < 32; i++) {
+    const uint16_t mv = reg(i);
+    if (mv > 500 && mv < 5000) { g_bms.cellmV[i] = mv; cells = i + 1; }
+  }
+  if (cells) g_bms.cellCount = cells;
+
+  uint8_t temps = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    const int16_t t = (int16_t)reg(32 + i) - 40;
+    if (t > -40 && t < 125) { g_bms.tempC[i] = (int8_t)t; temps = i + 1; }
+  }
+  if (temps) g_bms.tempCount = temps;
+
+  g_bms.packVoltage = reg(40) * 0.1f;
+  g_bms.current     = ((int32_t)reg(42) - 30000) * 0.1f;
+  g_bms.soc         = reg(43) * 0.1f;
+  g_bms.powerW      = g_bms.packVoltage * g_bms.current;
+  g_bms.powerKW     = g_bms.powerW / 1000.0f;
+  recomputeCellStats();
+  integrateEnergy();
+  g_bms.valid = true;
+  g_bms.lastUpdateMs = millis();
+}
+
+static void d2Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 5) {
+    if (g_rx[i] != 0xD2 || g_rx[i + 1] != 0x03) { i++; continue; }
+    const uint8_t bc = g_rx[i + 2];
+    const size_t total = 3 + bc + 2;
+    if (g_rxLen - i < total) break;
+    const uint16_t got  = g_rx[i + total - 2] | (g_rx[i + total - 1] << 8);
+    if (got != crc16(&g_rx[i], total - 2)) { i++; continue; }
+    d2Parse(&g_rx[i], total);
+    i += total;
+  }
+  if (i > 0) { memmove(g_rx, g_rx + i, g_rxLen - i); g_rxLen -= i; }
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFY
+// ---------------------------------------------------------------------------
+static void onNotify(NimBLERemoteCharacteristic *chr,
+                     uint8_t *data, size_t len, bool isNotify) {
+  if (g_rxLen + len > sizeof(g_rx)) g_rxLen = 0;
+  memcpy(g_rx + g_rxLen, data, len);
+  g_rxLen += len;
+
+  if (g_proto == PROTO_UNKNOWN) {
+    for (size_t i = 0; i < g_rxLen; i++) {
+      if (g_rx[i] == 0xA5) { g_proto = PROTO_A5; break; }
+      if (g_rx[i] == 0xD2 && i + 1 < g_rxLen && g_rx[i + 1] == 0x03) {
+        g_proto = PROTO_D2; break;
+      }
+    }
+    if (g_proto != PROTO_UNKNOWN) {
+      Serial.printf("\n[PROTO] detected: 0x%02X\n", (uint8_t)g_proto);
+      hexdump("[PROTO] raw:", g_rx, g_rxLen);
+    }
+  }
+
+  if (g_proto == PROTO_A5)      a5Consume();
+  else if (g_proto == PROTO_D2) d2Consume();
+}
+
+// ---------------------------------------------------------------------------
+// CALLBACKS
+// ---------------------------------------------------------------------------
+class ClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *c) override {
+    Serial.println("[BLE] connected");
+    c->updateConnParams(24, 48, 0, 400);   // relaxed: robust on a vibrating bike
+    g_connected = true;
+  }
+  void onDisconnect(NimBLEClient *c, int reason) override {
+    Serial.printf("[BLE] disconnected (reason %d)\n", reason);
+    g_connected = false;
+    g_bms.valid = false;
+    g_proto     = PROTO_UNKNOWN;
+    g_rxLen     = 0;
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+  }
+};
+static ClientCB g_clientCB;
+
+class ScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *dev) override {
+    if (!dev->haveName()) return;
+    const std::string n = dev->getName();
+    const bool hit = USE_EXACT_NAME ? (n == TARGET_NAME_EXACT)
+                                    : (n.rfind(TARGET_NAME_PREFIX, 0) == 0);
+    if (!hit) return;
+    Serial.printf("[BLE] found %s (%s) RSSI %d\n",
+                  n.c_str(), dev->getAddress().toString().c_str(), dev->getRSSI());
+    NimBLEDevice::getScan()->stop();
+    g_target    = const_cast<NimBLEAdvertisedDevice *>(dev);
+    g_doConnect = true;
+  }
+};
+static ScanCB g_scanCB;
+
+// ---------------------------------------------------------------------------
+// CONNECT
+// ---------------------------------------------------------------------------
+static bool connectToBms() {
+  if (!g_client) {
+    g_client = NimBLEDevice::createClient();
+    g_client->setClientCallbacks(&g_clientCB, false);
+    g_client->setConnectTimeout(10 * 1000);
+  }
+  if (!g_client->connect(g_target)) { Serial.println("[BLE] connect failed"); return false; }
+
+  NimBLERemoteService *svc = g_client->getService(SVC_UUID);
+  if (!svc) { Serial.println("[BLE] service FFF0 missing"); g_client->disconnect(); return false; }
+
+  NimBLERemoteCharacteristic *notif = svc->getCharacteristic(CHR_NOTIFY);
+  g_chrWrite                        = svc->getCharacteristic(CHR_WRITE);
+  if (!notif || !g_chrWrite) { Serial.println("[BLE] FFF1/FFF2 missing"); g_client->disconnect(); return false; }
+  if (!notif->subscribe(true, onNotify)) { Serial.println("[BLE] subscribe failed"); g_client->disconnect(); return false; }
+
+  Serial.println("[BLE] subscribed, probing protocol...");
+  a5Send(A5_SOC);                       // GD230 expected to answer this
+  delay(400);
+  if (g_proto == PROTO_UNKNOWN) { d2SendReadAll(); delay(400); }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// POLL
+// ---------------------------------------------------------------------------
+static void pollBms() {
+  if (g_proto == PROTO_D2) { d2SendReadAll(); return; }
+
+  static const uint8_t cmds[] = {
+    A5_SOC, A5_MINMAX_V, A5_MINMAX_T, A5_MOS,
+    A5_STATUS, A5_CELL_V, A5_CELL_T, A5_BALANCE, A5_FAULTS
+  };
+  for (uint8_t c : cmds) { a5Send(c); delay(60); }   // gap so replies don't collide
+
+  if (g_proto == PROTO_UNKNOWN) d2SendReadAll();
+}
+
+// ---------------------------------------------------------------------------
+// HEALTH / VALIDATION
+// ---------------------------------------------------------------------------
+static const char *deltaVerdict(uint16_t d) {
+  if (d < DELTA_WATCH_MV)    return "HEALTHY";
+  if (d < DELTA_INVESTIGATE) return "WATCH";
+  if (d < DELTA_ALARM_MV)    return "INVESTIGATE";
+  return "ALARM";
+}
+
+static void validatePack() {
+  if (g_bms.cellCount && g_bms.cellCount != PACK_SERIES)
+    Serial.printf("[WARN] cell count %u != configured %uS\n",
+                  g_bms.cellCount, PACK_SERIES);
+
+  if (g_bms.cellCount && g_bms.avgCellmV) {
+    const float expect = g_bms.cellCount * g_bms.avgCellmV / 1000.0f;
+    if (fabsf(expect - g_bms.packVoltage) > 1.0f)
+      Serial.printf("[WARN] sum-of-cells %.2f V vs pack %.2f V - check calibration\n",
+                    expect, g_bms.packVoltage);
+  }
+}
+
+static void printFaults() {
+  if (!g_bms.anyFault) { Serial.println("Faults    : none (status 0)"); return; }
+  Serial.println("Faults    : *** ACTIVE ***");
+  for (uint8_t b = 0; b < 7; b++)
+    for (uint8_t bit = 0; bit < 8; bit++)
+      if (g_bms.faultBytes[b] & (1 << bit))
+        Serial.printf("            - %s\n", FAULT_NAMES[b][bit]);
+}
+
+// ---------------------------------------------------------------------------
+// OUTPUT
+// ---------------------------------------------------------------------------
+static void printHuman() {
+  Serial.println(F("\n================ DALY BMS ================"));
+  Serial.printf("Pack      : %.1f V   %.1f A   %.3f kW\n",
+                g_bms.packVoltage, g_bms.current, g_bms.powerKW);
+  Serial.printf("SOC       : %.1f %%   %.1f Ah remaining  (of ~%.0f Ah)\n",
+                g_bms.soc, g_bms.remainingAh, PACK_NOMINAL_AH);
+  Serial.printf("Energy    : in %.3f kWh   out %.3f kWh\n",
+                g_bms.kWhIn, g_bms.kWhOut);
+  Serial.printf("Cells     : %uS   avg %u mV   delta %u mV [%s]\n",
+                g_bms.cellCount, g_bms.avgCellmV,
+                g_bms.cellDeltamV, deltaVerdict(g_bms.cellDeltamV));
+  Serial.printf("            min #%u %u mV    max #%u %u mV\n",
+                g_bms.minCellNum, g_bms.minCellmV,
+                g_bms.maxCellNum, g_bms.maxCellmV);
+
+  for (uint8_t i = 0; i < g_bms.cellCount; i++)
+    Serial.printf("  C%-2u %4u mV%s", i + 1, g_bms.cellmV[i],
+                  ((i + 1) % 5 == 0) ? "\n" : "  ");
+  if (g_bms.cellCount % 5) Serial.println();
+
+  Serial.print("Temps     : ");
+  for (uint8_t i = 0; i < g_bms.tempCount; i++)
+    Serial.printf("T%u=%d C  ", i + 1, g_bms.tempC[i]);
+  Serial.println();
+
+  const char *st = g_bms.chargeState == 1 ? "CHARGING"
+                 : g_bms.chargeState == 2 ? "DISCHARGING" : "IDLE";
+  Serial.printf("State     : %-11s ChgMOS %-3s DsgMOS %-3s Balance %s\n",
+                st, g_bms.chgMos ? "ON" : "OFF",
+                g_bms.dsgMos ? "ON" : "OFF", g_bms.balancing ? "ON" : "OFF");
+  Serial.printf("Cycles    : %u        BMS life ctr: %u\n",
+                g_bms.cycles, g_bms.bmsLife);
+  printFaults();
+  validatePack();
+  Serial.println(F("=========================================="));
+}
+
+// Compact MQTT payload — short keys because you pay per byte x 100 bikes
+static void printJson() {
+  Serial.print("{\"v\":");   Serial.print(g_bms.packVoltage, 1);
+  Serial.print(",\"i\":");   Serial.print(g_bms.current, 1);
+  Serial.print(",\"kw\":");  Serial.print(g_bms.powerKW, 3);
+  Serial.print(",\"soc\":"); Serial.print(g_bms.soc, 1);
+  Serial.print(",\"ah\":");  Serial.print(g_bms.remainingAh, 1);
+  Serial.print(",\"ein\":"); Serial.print(g_bms.kWhIn, 3);
+  Serial.print(",\"eout\":");Serial.print(g_bms.kWhOut, 3);
+  Serial.print(",\"cyc\":"); Serial.print(g_bms.cycles);
+  Serial.print(",\"avg\":"); Serial.print(g_bms.avgCellmV);
+  Serial.print(",\"dmv\":"); Serial.print(g_bms.cellDeltamV);
+  Serial.print(",\"chg\":"); Serial.print(g_bms.chgMos ? 1 : 0);
+  Serial.print(",\"dsg\":"); Serial.print(g_bms.dsgMos ? 1 : 0);
+  Serial.print(",\"bal\":"); Serial.print(g_bms.balancing ? 1 : 0);
+  Serial.print(",\"flt\":"); Serial.print(g_bms.anyFault ? 1 : 0);
+  Serial.print(",\"life\":");Serial.print(g_bms.bmsLife);
+
+  Serial.print(",\"t\":[");
+  for (uint8_t i = 0; i < g_bms.tempCount; i++) {
+    if (i) Serial.print(',');
+    Serial.print(g_bms.tempC[i]);
+  }
+  Serial.print("],\"c\":[");
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    if (i) Serial.print(',');
+    Serial.print(g_bms.cellmV[i]);
+  }
+  Serial.println("]}");
+}
+
+// ---------------------------------------------------------------------------
+// ARDUINO
+// ---------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(2000);                          // USB-CDC enumeration on C3
+  Serial.println(F("\n\n=== DALY BMS BLE reader v2 (ESP32-C3) ==="));
+  Serial.printf("Target : %s\n", USE_EXACT_NAME ? TARGET_NAME_EXACT : TARGET_NAME_PREFIX);
+  Serial.printf("Pack   : %dS  ~%.0f Ah  (~%.2f kWh)\n\n",
+                PACK_SERIES, PACK_NOMINAL_AH,
+                PACK_SERIES * CELL_NOMINAL_V * PACK_NOMINAL_AH / 1000.0f);
+
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);     // max TX: metal frame + enclosure
+
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&g_scanCB, false);
+  scan->setActiveScan(true);                  // required to read the name
+  scan->setInterval(100);
+  scan->setWindow(80);
+  scan->start(SCAN_TIME_S, false);
+}
+
+void loop() {
+  static uint32_t lastPoll = 0;
+
+  if (g_doConnect) {
+    g_doConnect = false;
+    if (!connectToBms()) {
+      delay(2000);
+      NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+    }
+  }
+
+  if (g_connected && millis() - lastPoll >= POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    pollBms();
+    if (g_bms.valid && millis() - g_bms.lastUpdateMs < STALE_TIMEOUT_MS) {
+      printHuman();
+      printJson();
+    } else {
+      Serial.println("[WARN] no valid data (stale / unparsed)");
+    }
+  }
+
+  if (!g_connected && !g_doConnect && !NimBLEDevice::getScan()->isScanning())
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+
+  delay(10);
+}
