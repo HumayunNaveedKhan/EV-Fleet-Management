@@ -58,7 +58,7 @@ border:1px solid var(--line);font-size:10px;letter-spacing:.8px;text-transform:u
 }
 </style></head><body>
 
-<div class="hd"><div><h1 id="bid">EV Bike</h1><div class="sub" id="sub">connecting via Cloud…</div></div>
+<div class="hd"><div><h1 id="bid">EV Bike</h1><div class="sub" id="sub">connecting to Firebase…</div></div>
 <div class="pill"><span class="dot" id="dot"></span><span id="lnk">OFFLINE</span></div></div>
 
 <div id="wrap">
@@ -115,14 +115,21 @@ style="transition:stroke-dashoffset .7s"/></svg>
 <div class="ft" id="ft">—</div>
 </div>
 
-<script>
-// ========================================================
-// PASTE YOUR FIREBASE URL BELOW (Keep the /bike.json)
-// ========================================================
-const FIREBASE_URL = "https://ev-bike-fleet-telematics-default-rtdb.firebaseio.com/bike.json";
+<script type="module">
+// Import the Official Firebase Web SDK
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.10.0/firebase-app.js";
+import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.10.0/firebase-database.js";
+
+const firebaseConfig = {
+  databaseURL: "https://ev-bike-fleet-telematics-default-rtdb.firebaseio.com"
+};
+
+const app = initializeApp(firebaseConfig);
+const db = getDatabase(app);
+const bikeRef = ref(db, 'bike');
 
 const $=i=>document.getElementById(i);
-const C=540.4; let miss=0;
+const C=540.4;
 let map, mark, path;
 
 function initMap(lat, lng){
@@ -134,25 +141,26 @@ function initMap(lat, lng){
 
 function paint(d){
  if(!d) return;
- $('bid').textContent=d.id; $('sub').textContent=d.ns+'S LiFePO4 · '+d.ahn+' Ah · '+d.rssi+' dBm';
+ $('bid').textContent=d.id || "EVBIKE"; 
+ $('sub').textContent=(d.ns||0)+'S LiFePO4 · '+(d.ahn||0)+' Ah · '+(d.rssi||0)+' dBm';
  const on=d.ok==1; $('dot').className='dot'+(on?' on':''); $('lnk').textContent=on?'LIVE':'NO DATA';
  $('wrap').className=on?'':'off';
 
- const soc=d.soc; $('soc').textContent=soc.toFixed(1);
+ const soc=d.soc||0; $('soc').textContent=soc.toFixed(1);
  $('arc').style.strokeDashoffset=C-(C*Math.min(soc,100)/100);
  $('arc').style.stroke=soc>50?'var(--ok)':soc>20?'var(--warn)':'var(--bad)';
 
- const S=['IDLE','CHARGING','DISCHARGING'][d.st]||'IDLE';
+ const S=['IDLE','CHARGING','DISCHARGING'][d.st||0]||'IDLE';
  $('st').textContent=S; $('st').style.color=d.st==1?'var(--ok)':d.st==2?'var(--acc)':'var(--dim)';
 
- $('v').textContent=d.v.toFixed(1); $('i').textContent=d.i.toFixed(1);
+ $('v').textContent=(d.v||0).toFixed(1); $('i').textContent=(d.i||0).toFixed(1);
  $('i').style.color=d.i<-.1?'var(--acc)':d.i>.1?'var(--ok)':'var(--tx)';
- $('kw').textContent=Math.abs(d.kw).toFixed(2); $('ah').textContent=d.ah.toFixed(1);
- $('tp').textContent=d.t.length?d.t[0]:'--'; $('cyc').textContent=d.cyc;
- $('eo').textContent=d.eout.toFixed(3); $('ei').textContent=d.ein.toFixed(3);
+ $('kw').textContent=Math.abs(d.kw||0).toFixed(2); $('ah').textContent=(d.ah||0).toFixed(1);
+ $('tp').textContent=(d.t && d.t.length)?d.t[0]:'--'; $('cyc').textContent=d.cyc||0;
+ $('eo').textContent=(d.eout||0).toFixed(3); $('ei').textContent=(d.ein||0).toFixed(3);
 
- $('spd').textContent=d.spd.toFixed(1) + ' km/h';
- if(d.lat!==0 && d.lng!==0) {
+ $('spd').textContent=(d.spd||0).toFixed(1) + ' km/h';
+ if(d.lat && d.lng && d.lat!==0) {
    if(!map) initMap(d.lat, d.lng);
    else {
      mark.setLatLng([d.lat, d.lng]);
@@ -161,41 +169,45 @@ function paint(d){
    }
  }
 
- $('mn').textContent=d.mn; $('mni').textContent='#'+d.mni;
- $('mx').textContent=d.mx; $('mxi').textContent='#'+d.mxi; $('dmv').textContent=d.dmv;
+ $('mn').textContent=d.mn||'--'; $('mni').textContent='#'+(d.mni||0);
+ $('mx').textContent=d.mx||'--'; $('mxi').textContent='#'+(d.mxi||0); $('dmv').textContent=d.dmv||'--';
 
- const hb=$('hb'); hb.textContent=d.hv;
+ const hb=$('hb'); hb.textContent=d.hv||'--';
  const col={'HEALTHY':'--ok','WATCH':'--warn','INVESTIGATE':'--warn','ALARM':'--bad','UNDER LOAD':'--vio'}[d.hv]||'--dim';
  hb.style.background='color-mix(in srgb,var('+col+') 16%,transparent)'; hb.style.color='var('+col+')';
 
- const lo=d.mn-3, hi=d.mx+3, sp=Math.max(hi-lo,1); let h='';
- d.c.forEach((mv,k)=>{
-   const w=Math.max(3,Math.min(100,(mv-lo)/sp*100));
-   const cls=(k+1)==d.mxi?'fill hi':(k+1)==d.mni?'fill lo':'fill';
-   h+='<div class="cell"><span class="n">'+(k+1)+'</span><div class="bar"><div class="'+cls+'" style="width:'+w+'%"></div></div><span class="mv">'+mv+'</span></div>';
- }); $('cl').innerHTML=h;
+ const lo=(d.mn||0)-3, hi=(d.mx||0)+3, sp=Math.max(hi-lo,1); let h='';
+ if(d.c){
+   d.c.forEach((mv,k)=>{
+     const w=Math.max(3,Math.min(100,(mv-lo)/sp*100));
+     const cls=(k+1)==d.mxi?'fill hi':(k+1)==d.mni?'fill lo':'fill';
+     h+='<div class="cell"><span class="n">'+(k+1)+'</span><div class="bar"><div class="'+cls+'" style="width:'+w+'%"></div></div><span class="mv">'+mv+'</span></div>';
+   });
+ }
+ $('cl').innerHTML=h;
 
  const set=(id,on)=>{const e=$(id);e.textContent=on?'ON':'OFF';e.style.color=on?'var(--ok)':'var(--dim)';};
  set('cm',d.chg); set('dm',d.dsg);
  $('bl').textContent=d.bal?'ON':'OFF'; $('bl').style.color=d.bal?'var(--warn)':'var(--dim)';
- $('lf').textContent=d.life; $('lf').style.color='var(--tx)';
+ $('lf').textContent=d.life||0; $('lf').style.color='var(--tx)';
 
- if(d.f.length){$('fc').style.display='block';$('fl').innerHTML=d.f.map(x=>'<div>▲ '+x+'</div>').join('');}
+ if(d.f && d.f.length){$('fc').style.display='block';$('fl').innerHTML=d.f.map(x=>'<div>▲ '+x+'</div>').join('');}
  else $('fc').style.display='none';
 
- const u=d.up,hh=(u/3600|0),mm=(u%3600/60|0);
- $('ft').textContent='avg cell '+d.avg+' mV · uptime '+hh+'h '+mm+'m · sats '+d.sats;
+ const u=d.up||0, hh=(u/3600|0), mm=(u%3600/60|0);
+ $('ft').textContent='avg cell '+(d.avg||0)+' mV · uptime '+hh+'h '+mm+'m · sats '+(d.sats||0);
 }
 
-async function tick(){
- try{ 
-    // Fetching directly from Firebase Database REST API!
-    const r=await fetch(FIREBASE_URL, {cache:'no-store'}); 
-    paint(await r.json()); miss=0; 
- }
- catch(e){ 
-    if(++miss>3){$('dot').className='dot';$('lnk').textContent='NO CLOUD';$('wrap').className='off';} 
- }
-}
-tick(); setInterval(tick, 2000); // Check Firebase every 2 seconds
+// Automatically streams live data - No refreshing needed!
+onValue(bikeRef, (snapshot) => {
+  const data = snapshot.val();
+  if (data) {
+    paint(data);
+  } else {
+    $('dot').className='dot'; $('lnk').textContent='WAITING'; $('wrap').className='off';
+  }
+}, (error) => {
+  console.error("Firebase Error:", error);
+  $('dot').className='dot'; $('lnk').textContent='NO CLOUD'; $('wrap').className='off';
+});
 </script></body></html>
