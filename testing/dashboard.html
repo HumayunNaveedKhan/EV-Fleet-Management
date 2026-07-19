@@ -1,0 +1,214 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#080b10"><title>EV Bike · Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:#080b10;--card:#121821;--card2:#0e141c;--line:#1f2937;--tx:#e8eef7;--dim:#7d8da3;
+--ok:#00e08a;--warn:#ffb020;--bad:#ff4d5e;--acc:#38bdf8;--vio:#a78bfa}
+body{background:var(--bg);color:var(--tx);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+padding:14px;padding-bottom:40px;max-width:520px;margin:0 auto}
+
+/* IP Config Bar */
+.config-bar { display:flex; gap:8px; margin-bottom:16px; background:var(--card); padding:10px; border-radius:12px; border:1px solid var(--line); }
+.config-bar input { flex:1; background:var(--card2); border:1px solid var(--line); color:var(--tx); padding:8px 12px; border-radius:8px; font-size:14px; }
+.config-bar button { background:var(--ok); color:#000; border:none; padding:8px 16px; border-radius:8px; font-weight:bold; cursor:pointer; }
+
+.hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.hd h1{font-size:17px;font-weight:650;letter-spacing:-.2px}
+.hd .sub{font-size:11px;color:var(--dim);margin-top:2px;font-variant-numeric:tabular-nums}
+.pill{display:flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
+border-radius:999px;padding:5px 11px;font-size:11px;font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--bad)}
+.dot.on{background:var(--ok);box-shadow:0 0 0 0 rgba(0,224,138,.6);animation:p 2s infinite}
+@keyframes p{70%{box-shadow:0 0 0 7px rgba(0,224,138,0)}100%{box-shadow:0 0 0 0 rgba(0,224,138,0)}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:12px;position:relative;overflow:hidden;}
+.gauge{display:flex;flex-direction:column;align-items:center;padding:20px 16px 16px}
+.gwrap{position:relative;width:200px;height:200px}
+svg{transform:rotate(-90deg)}
+.gtx{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.gtx b{font-size:46px;font-weight:700;letter-spacing:-2px;font-variant-numeric:tabular-nums;line-height:1}
+.gtx small{font-size:11px;color:var(--dim);letter-spacing:2.5px;margin-top:6px;text-transform:uppercase}
+.state{margin-top:14px;font-size:12px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;
+padding:6px 16px;border-radius:999px;background:var(--card2);border:1px solid var(--line)}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px}
+.g2{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 12px;text-align:center}
+.tile .k{font-size:10px;color:var(--dim);letter-spacing:1.1px;text-transform:uppercase;margin-bottom:5px}
+.tile .val{font-size:21px;font-weight:680;font-variant-numeric:tabular-nums;letter-spacing:-.5px}
+.tile .u{font-size:11px;color:var(--dim);font-weight:500;margin-left:1px}
+.ttl{font-size:11px;color:var(--dim);letter-spacing:1.3px;text-transform:uppercase;
+margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.badge{font-size:10px;font-weight:700;padding:3px 9px;border-radius:6px;letter-spacing:.6px}
+.cells{display:flex;flex-direction:column;gap:5px}
+.cell{display:flex;align-items:center;gap:9px;font-size:11px}
+.cell .n{width:24px;color:var(--dim);font-variant-numeric:tabular-nums;flex:none}
+.bar{flex:1;height:16px;background:var(--card2);border-radius:5px;overflow:hidden;position:relative}
+.fill{height:100%;border-radius:5px;background:linear-gradient(90deg,#0e7490,#38bdf8);transition:width .45s}
+.fill.hi{background:linear-gradient(90deg,#a16207,#fbbf24)}
+.fill.lo{background:linear-gradient(90deg,#7f1d1d,#f87171)}
+.cell .mv{width:52px;text-align:right;font-variant-numeric:tabular-nums;font-weight:600;flex:none}
+.mos{display:flex;gap:8px;flex-wrap:wrap}
+.m{flex:1;min-width:82px;text-align:center;padding:9px 6px;border-radius:10px;background:var(--card2);
+border:1px solid var(--line);font-size:10px;letter-spacing:.8px;text-transform:uppercase;color:var(--dim)}
+.m b{display:block;font-size:13px;margin-top:3px;letter-spacing:0}
+.flt{background:rgba(255,77,94,.09);border-color:rgba(255,77,94,.35)}
+.flt div{color:var(--bad);font-size:12px;padding:3px 0;font-weight:600}
+.ft{text-align:center;color:var(--dim);font-size:10px;margin-top:16px;font-variant-numeric:tabular-nums}
+.off{opacity:.4;filter:saturate(.3);transition:.3s}
+#map{height:250px;width:100%;margin:0 -16px -16px;background:var(--card2)}
+.leaflet-layer, .leaflet-control-zoom-in, .leaflet-control-zoom-out, .leaflet-control-attribution {
+  filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
+}
+</style></head><body>
+
+<div class="config-bar">
+  <input type="text" id="esp-ip" value="http://evbike.local" placeholder="e.g. http://192.168.43.15">
+  <button onclick="updateIP()">Connect</button>
+</div>
+
+<div class="hd"><div><h1 id="bid">EV Bike</h1><div class="sub" id="sub">connecting…</div></div>
+<div class="pill"><span class="dot" id="dot"></span><span id="lnk">OFFLINE</span></div></div>
+
+<div id="wrap">
+<div class="card gauge"><div class="gwrap">
+<svg width="200" height="200" viewBox="0 0 200 200">
+<circle cx="100" cy="100" r="86" fill="none" stroke="#182130" stroke-width="15"/>
+<circle id="arc" cx="100" cy="100" r="86" fill="none" stroke="var(--ok)" stroke-width="15"
+stroke-linecap="round" stroke-dasharray="540.4" stroke-dashoffset="540.4"
+style="transition:stroke-dashoffset .7s"/></svg>
+<div class="gtx"><b id="soc">--</b><small>State of charge</small></div></div>
+<div class="state" id="st">—</div></div>
+
+<div class="card">
+  <div class="ttl">Live Trajectory (30m)
+    <span class="badge" style="background:#1f2937;color:var(--tx)" id="spd">0.0 km/h</span>
+  </div>
+  <div id="map"></div>
+</div>
+
+<div class="g3">
+<div class="tile"><div class="k">Voltage</div><div class="val"><span id="v">--</span><span class="u">V</span></div></div>
+<div class="tile"><div class="k">Current</div><div class="val"><span id="i">--</span><span class="u">A</span></div></div>
+<div class="tile"><div class="k">Power</div><div class="val"><span id="kw">--</span><span class="u">kW</span></div></div>
+</div>
+
+<div class="g3">
+<div class="tile"><div class="k">Remaining</div><div class="val"><span id="ah">--</span><span class="u">Ah</span></div></div>
+<div class="tile"><div class="k">Temp</div><div class="val"><span id="tp">--</span><span class="u">°C</span></div></div>
+<div class="tile"><div class="k">Cycles</div><div class="val" id="cyc">--</div></div>
+</div>
+
+<div class="g2">
+<div class="tile"><div class="k">Energy out</div><div class="val"><span id="eo">--</span><span class="u">kWh</span></div></div>
+<div class="tile"><div class="k">Energy in</div><div class="val"><span id="ei">--</span><span class="u">kWh</span></div></div>
+</div>
+
+<div class="card" id="fc" style="display:none">
+<div class="ttl">Active faults</div><div class="flt" id="fl"></div></div>
+
+<div class="card"><div class="ttl"><span>Cell balance</span>
+<span class="badge" id="hb">—</span></div>
+<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--dim);margin-bottom:12px">
+<span>min <b id="mn" style="color:var(--tx)">--</b> mV <span id="mni"></span></span>
+<span>Δ <b id="dmv" style="color:var(--tx)">--</b> mV</span>
+<span>max <b id="mx" style="color:var(--tx)">--</b> mV <span id="mxi"></span></span></div>
+<div class="cells" id="cl"></div></div>
+
+<div class="card"><div class="ttl">Status</div><div class="mos">
+<div class="m">Chg MOS<b id="cm">—</b></div>
+<div class="m">Dsg MOS<b id="dm">—</b></div>
+<div class="m">Balance<b id="bl">—</b></div>
+<div class="m">BMS life<b id="lf">—</b></div></div></div>
+
+<div class="ft" id="ft">—</div>
+</div>
+
+<script>
+const $=i=>document.getElementById(i);
+const C=540.4; let miss=0;
+let map, mark, path;
+let esp_ip = localStorage.getItem('ev_ip') || 'http://evbike.local';
+$('esp-ip').value = esp_ip;
+
+function updateIP() {
+  let val = $('esp-ip').value.trim();
+  if(!val.startsWith('http')) val = 'http://' + val;
+  esp_ip = val;
+  localStorage.setItem('ev_ip', esp_ip);
+  tick(); // Force immediate refresh
+}
+
+function initMap(lat, lng){
+  map = L.map('map').setView([lat, lng], 15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  mark = L.circleMarker([lat, lng], {color: '#080b10', weight: 2, fillColor: 'var(--acc)', fillOpacity: 1, radius: 8}).addTo(map);
+  path = L.polyline([], {color: 'var(--acc)', weight: 4, opacity: 0.8}).addTo(map);
+}
+
+function paint(d){
+ $('bid').textContent=d.id; $('sub').textContent=d.ns+'S LiFePO4 · '+d.ahn+' Ah · '+d.rssi+' dBm';
+ const on=d.ok==1; $('dot').className='dot'+(on?' on':''); $('lnk').textContent=on?'LIVE':'NO DATA';
+ $('wrap').className=on?'':'off';
+
+ const soc=d.soc; $('soc').textContent=soc.toFixed(1);
+ $('arc').style.strokeDashoffset=C-(C*Math.min(soc,100)/100);
+ $('arc').style.stroke=soc>50?'var(--ok)':soc>20?'var(--warn)':'var(--bad)';
+
+ const S=['IDLE','CHARGING','DISCHARGING'][d.st]||'IDLE';
+ $('st').textContent=S; $('st').style.color=d.st==1?'var(--ok)':d.st==2?'var(--acc)':'var(--dim)';
+
+ $('v').textContent=d.v.toFixed(1); $('i').textContent=d.i.toFixed(1);
+ $('i').style.color=d.i<-.1?'var(--acc)':d.i>.1?'var(--ok)':'var(--tx)';
+ $('kw').textContent=Math.abs(d.kw).toFixed(2); $('ah').textContent=d.ah.toFixed(1);
+ $('tp').textContent=d.t.length?d.t[0]:'--'; $('cyc').textContent=d.cyc;
+ $('eo').textContent=d.eout.toFixed(3); $('ei').textContent=d.ein.toFixed(3);
+
+ $('spd').textContent=d.spd.toFixed(1) + ' km/h';
+ if(d.lat!==0 && d.lng!==0) {
+   if(!map) initMap(d.lat, d.lng);
+   else {
+     mark.setLatLng([d.lat, d.lng]);
+     if(!map.getBounds().contains([d.lat, d.lng])) map.panTo([d.lat, d.lng]);
+     if(d.trk && d.trk.length > 0) path.setLatLngs(d.trk);
+   }
+ }
+
+ $('mn').textContent=d.mn; $('mni').textContent='#'+d.mni;
+ $('mx').textContent=d.mx; $('mxi').textContent='#'+d.mxi; $('dmv').textContent=d.dmv;
+
+ const hb=$('hb'); hb.textContent=d.hv;
+ const col={'HEALTHY':'--ok','WATCH':'--warn','INVESTIGATE':'--warn','ALARM':'--bad','UNDER LOAD':'--vio'}[d.hv]||'--dim';
+ hb.style.background='color-mix(in srgb,var('+col+') 16%,transparent)'; hb.style.color='var('+col+')';
+
+ const lo=d.mn-3, hi=d.mx+3, sp=Math.max(hi-lo,1); let h='';
+ d.c.forEach((mv,k)=>{
+   const w=Math.max(3,Math.min(100,(mv-lo)/sp*100));
+   const cls=(k+1)==d.mxi?'fill hi':(k+1)==d.mni?'fill lo':'fill';
+   h+='<div class="cell"><span class="n">'+(k+1)+'</span><div class="bar"><div class="'+cls+'" style="width:'+w+'%"></div></div><span class="mv">'+mv+'</span></div>';
+ }); $('cl').innerHTML=h;
+
+ const set=(id,on)=>{const e=$(id);e.textContent=on?'ON':'OFF';e.style.color=on?'var(--ok)':'var(--dim)';};
+ set('cm',d.chg); set('dm',d.dsg);
+ $('bl').textContent=d.bal?'ON':'OFF'; $('bl').style.color=d.bal?'var(--warn)':'var(--dim)';
+ $('lf').textContent=d.life; $('lf').style.color='var(--tx)';
+
+ if(d.f.length){$('fc').style.display='block';$('fl').innerHTML=d.f.map(x=>'<div>▲ '+x+'</div>').join('');}
+ else $('fc').style.display='none';
+
+ const u=d.up,hh=(u/3600|0),mm=(u%3600/60|0);
+ $('ft').textContent='avg cell '+d.avg+' mV · uptime '+hh+'h '+mm+'m · sats '+d.sats;
+}
+
+async function tick(){
+ try{ 
+    const r=await fetch(esp_ip + '/api/data',{cache:'no-store'}); 
+    paint(await r.json()); miss=0; 
+ }
+ catch(e){ 
+    if(++miss>3){$('dot').className='dot';$('lnk').textContent='NO LINK';$('wrap').className='off';} 
+ }
+}
+tick(); setInterval(tick,1000);
+</script></body></html>
