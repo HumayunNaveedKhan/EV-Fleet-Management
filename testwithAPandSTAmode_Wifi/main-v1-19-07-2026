@@ -1,0 +1,246 @@
+/*
+ * =============================================================================
+ *  EV BIKE NODE  --  OPTION A  (ESP32-C3, STA mode -> Google Sheets DIRECT)
+ * =============================================================================
+ *
+ *  This is the DEPLOYMENT path. The C3 joins your phone's hotspot (which has
+ *  internet) and POSTs each sample straight to a Google Apps Script web app.
+ *  The phone's browser is only used to view the dashboard and tap a bike;
+ *  the LOGGING goes C3 -> internet -> Google with no phone involvement.
+ *
+ *  WHY STA:  In AP mode the C3 has no upstream internet, so it CANNOT reach
+ *            Google. STA (join a hotspot) is the only way for the C3 itself
+ *            to log to Sheets.
+ *
+ *  ---------------------------------------------------------------------------
+ *  WIFI  --  NO WIRING. The C3 has WiFi on-chip (trace antenna on the board).
+ *            You only set the SSID/PASS below. That's the whole "connection".
+ *  ---------------------------------------------------------------------------
+ *
+ *  GNSS WIRING  (Ebyte E108-GN03D, AT6558R, 9600 8N1 NMEA, 2.7-3.6V)
+ *  -- C3 pins (SuperMini). NO level shifter: module is 3.3V native.
+ *        GN03D  VCC  -> C3 3V3
+ *        GN03D  GND  -> C3 GND
+ *        GN03D  TXD  -> C3 GPIO4   (this sketch's GNSS RX)
+ *        GN03D  RXD  -> C3 GPIO5   (optional; only if sending config)
+ *     For an ACTIVE antenna, short the board's RF_POWER jumper.
+ *
+ *  PHONE HOTSPOT STEPS
+ *     1. Phone: turn ON Personal Hotspot. Note its name + password.
+ *     2. Put them in STA_SSID / STA_PASS below. Flash.
+ *     3. Watch Serial -> it prints  "Dashboard: http://192.168.x.x"
+ *        (NOT 192.168.4.1 -- that was AP mode). Open that URL in the phone.
+ *     4. iPhone: keep the hotspot screen awake during first connect.
+ *
+ *  GOOGLE SHEETS  (one-time)
+ *     - New Google Sheet -> Extensions -> Apps Script -> paste the script at
+ *       the bottom of this file -> Deploy -> New deployment -> Web app ->
+ *       Execute as: Me, Access: Anyone -> copy the /exec URL into GS_PATH.
+ *
+ *  BOARD: ESP32C3 Dev Module | USB CDC On Boot: Enabled | Partition: Huge APP
+ *  LIB  : NimBLE-Arduino
+ * =============================================================================
+ */
+
+#include <NimBLEDevice.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiClientSecure.h>
+
+// ---- WIFI (phone hotspot) --------------------------------------------------
+#define STA_SSID   "HHRCM1"
+#define STA_PASS   "24456883"
+
+// ---- GOOGLE SHEETS ---------------------------------------------------------
+#define GS_ENABLE  1
+#define GS_HOST    "script.google.com"
+#define GS_PATH    "/macros/s/AKfycbw_DGzUBRAdccXSBPSbGTc_Sm1mp582IAf1xhaVuF3JJ-DUlzbDNk-aPIGIK1abe0H0/exec"
+#define GS_MIN_MS  15000UL
+
+// ---- GNSS (C3 pins) --------------------------------------------------------
+#define GNSS_RX 4          // <- GN03D TXD
+#define GNSS_TX 5          // -> GN03D RXD (optional)
+#define GNSS_BAUD 9600
+HardwareSerial GNSS(1);    // C3 has UART0(usb/debug) + UART1 -> use UART1
+
+// ---- pack ------------------------------------------------------------------
+#define PACK_SERIES 15
+#define REST_A 1.0f
+#define DELTA_WATCH 20
+#define DELTA_ALARM 100
+
+static const uint32_t POLL_MS=2000, SCAN_S=4, STALE_MS=15000;
+#define MAX_CELLS 16
+#define MAX_FOUND 12
+
+static NimBLEUUID SVC("0000fff0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID C_NOTIFY("0000fff1-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID C_WRITE("0000fff2-0000-1000-8000-00805f9b34fb");
+
+struct Bms{
+  float v=0,i=0,kw=0,soc=0,ah=0; uint16_t cyc=0,cellmV[MAX_CELLS]={0};
+  uint16_t mn=0,mx=0,avg=0,dmv=0; uint8_t mni=0,mxi=0,ns=0; int8_t temp=0;
+  bool chg=false,dsg=false,bal=false; uint8_t st=0,life=0; bool fault=false;
+  double kwhOut=0,kwhIn=0; bool valid=false; uint32_t lastMs=0;
+};
+static Bms b;
+struct G{double lat=0,lon=0;float spd=0;uint8_t sats=0;bool fix=false;uint32_t lastMs=0;};
+static G g;
+struct Found{char name[20];char mac[18];int rssi;};
+static Found g_found[MAX_FOUND]; static uint8_t g_nFound=0;
+static char g_selMac[18]=""; static bool g_haveSel=false;
+enum Proto:uint8_t{P_NONE=0,P_A5=0xA5}; static Proto g_proto=P_NONE;
+static NimBLEClient*g_cli=nullptr; static NimBLERemoteCharacteristic*g_wr=nullptr;
+static NimBLEAdvertisedDevice*g_target=nullptr;
+static volatile bool g_connect=false,g_online=false;
+static uint8_t g_rx[400]; static size_t g_rxN=0;
+static WebServer web(80);
+
+static uint16_t be16(const uint8_t*p){return (uint16_t)p[0]<<8|p[1];}
+static uint32_t be32(const uint8_t*p){return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3];}
+static const char* verdict(){if(fabsf(b.i)>REST_A)return "LOAD";if(b.dmv<DELTA_WATCH)return "OK";if(b.dmv<DELTA_ALARM)return "WATCH";return "ALARM";}
+
+// ---- GNSS ------------------------------------------------------------------
+static double nmeaDeg(const char*f,char q){double raw=atof(f);int d=(int)(raw/100);double dec=d+(raw-d*100)/60.0;return (q=='S'||q=='W')?-dec:dec;}
+static void gnssLine(char*s){
+  if(!strstr(s,"RMC")&&!strstr(s,"GGA"))return;
+  char*t[16];int n=0; for(char*p=strtok(s,",");p&&n<16;p=strtok(NULL,","))t[n++]=p;
+  if(n<7)return;
+  if(strstr(t[0],"RMC")){ if(t[2][0]=='A'){g.lat=nmeaDeg(t[3],t[4][0]);g.lon=nmeaDeg(t[5],t[6][0]);g.spd=atof(t[7])*1.852f;g.fix=true;g.lastMs=millis();} else g.fix=false; }
+  else if(strstr(t[0],"GGA")&&n>7){g.sats=atoi(t[7]);}
+}
+static void gnssPoll(){static char L[100];static uint8_t li=0;
+  while(GNSS.available()){char c=GNSS.read();
+    if(c=='\n'){L[li]=0;if(li>6)gnssLine(L);li=0;} else if(c!='\r'&&li<99)L[li++]=c;}}
+
+// ---- 0xA5 BMS --------------------------------------------------------------
+enum:uint8_t{A5_SOC=0x90,A5_MOS=0x93,A5_STAT=0x94,A5_CV=0x95,A5_CT=0x96,A5_BAL=0x97,A5_FLT=0x98};
+static void a5(uint8_t cmd){uint8_t f[13]={0};f[0]=0xA5;f[1]=0x80;f[2]=cmd;f[3]=8;uint8_t cs=0;for(int i=0;i<12;i++)cs+=f[i];f[12]=cs;if(g_wr)g_wr->writeValue(f,13,false);}
+static void cellStats(){if(!b.ns)return;uint32_t sum=0;uint16_t mn=0xFFFF,mx=0;uint8_t mni=0,mxi=0,c=0;
+  for(uint8_t i=0;i<b.ns;i++){uint16_t v=b.cellmV[i];if(!v)continue;sum+=v;c++;if(v<mn){mn=v;mni=i+1;}if(v>mx){mx=v;mxi=i+1;}}
+  if(c!=b.ns)return;b.avg=sum/c;b.mn=mn;b.mni=mni;b.mx=mx;b.mxi=mxi;b.dmv=mx-mn;}
+static void energy(){static uint32_t last=0;uint32_t now=millis();if(!last){last=now;return;}uint32_t dt=now-last;last=now;if(dt>30000)return;double k=(b.v*b.i/1000.0)*(dt/3600000.0);if(b.i>0.1)b.kwhIn+=k;else if(b.i<-0.1)b.kwhOut+=-k;}
+static void a5Parse(const uint8_t*f){const uint8_t*d=&f[4];switch(f[2]){
+  case A5_SOC:b.v=be16(d)*0.1f;b.i=((int32_t)be16(d+4)-30000)*0.1f;b.soc=be16(d+6)*0.1f;b.kw=b.v*b.i/1000.0f;energy();b.valid=true;b.lastMs=millis();break;
+  case A5_MOS:b.st=d[0];b.chg=d[1];b.dsg=d[2];b.life=d[3];b.ah=be32(d+4)/1000.0f;break;
+  case A5_STAT:if(d[0]&&d[0]<=MAX_CELLS)b.ns=d[0];b.cyc=be16(d+5);break;
+  case A5_CV:{uint8_t fr=d[0];if(!fr||fr>6)break;for(uint8_t i=0;i<3;i++){uint8_t x=(fr-1)*3+i;if(x>=MAX_CELLS)break;uint16_t mv=be16(d+1+i*2);if(mv&&mv<5000)b.cellmV[x]=mv;}if(b.ns&&fr>=(b.ns+2)/3)cellStats();break;}
+  case A5_CT:b.temp=(int16_t)d[1]-40;break;
+  case A5_BAL:{bool a=false;for(uint8_t i=0;i<6;i++)if(d[i])a=true;b.bal=a;break;}
+  case A5_FLT:{bool a=false;for(uint8_t i=0;i<7;i++)if(d[i])a=true;b.fault=a;break;}}}
+static void a5Consume(){size_t i=0;while(g_rxN-i>=13){if(g_rx[i]!=0xA5){i++;continue;}uint8_t cs=0;for(int k=0;k<12;k++)cs+=g_rx[i+k];if(cs!=g_rx[i+12]){i++;continue;}a5Parse(&g_rx[i]);i+=13;}if(i){memmove(g_rx,g_rx+i,g_rxN-i);g_rxN-=i;}}
+
+// ---- BLE -------------------------------------------------------------------
+static void onNotify(NimBLERemoteCharacteristic*c,uint8_t*data,size_t len,bool n){if(g_rxN+len>sizeof(g_rx))g_rxN=0;memcpy(g_rx+g_rxN,data,len);g_rxN+=len;if(g_proto==P_NONE)for(size_t i=0;i<g_rxN;i++)if(g_rx[i]==0xA5){g_proto=P_A5;break;}if(g_proto==P_A5)a5Consume();}
+class CliCB:public NimBLEClientCallbacks{void onConnect(NimBLEClient*c)override{c->updateConnParams(24,48,0,400);g_online=true;}void onDisconnect(NimBLEClient*c,int r)override{g_online=false;b.valid=false;g_proto=P_NONE;g_rxN=0;}};
+static CliCB g_cliCB;
+class ScanCB:public NimBLEScanCallbacks{void onResult(const NimBLEAdvertisedDevice*d)override{
+  if(!d->haveName())return;std::string nm=d->getName();if(nm.rfind("DL-",0)!=0)return;std::string mac=d->getAddress().toString();
+  bool known=false;for(uint8_t i=0;i<g_nFound;i++)if(!strcmp(g_found[i].mac,mac.c_str())){g_found[i].rssi=d->getRSSI();known=true;break;}
+  if(!known&&g_nFound<MAX_FOUND){strncpy(g_found[g_nFound].name,nm.c_str(),19);strncpy(g_found[g_nFound].mac,mac.c_str(),17);g_found[g_nFound].rssi=d->getRSSI();g_nFound++;}
+  if(g_haveSel&&!g_online&&!strcmp(mac.c_str(),g_selMac)){NimBLEDevice::getScan()->stop();g_target=const_cast<NimBLEAdvertisedDevice*>(d);g_connect=true;}}};
+static ScanCB g_scanCB;
+static bool connectSel(){if(!g_cli){g_cli=NimBLEDevice::createClient();g_cli->setClientCallbacks(&g_cliCB,false);g_cli->setConnectTimeout(10000);}
+  if(!g_cli->connect(g_target))return false;NimBLERemoteService*s=g_cli->getService(SVC);if(!s){g_cli->disconnect();return false;}
+  NimBLERemoteCharacteristic*nf=s->getCharacteristic(C_NOTIFY);g_wr=s->getCharacteristic(C_WRITE);if(!nf||!g_wr){g_cli->disconnect();return false;}
+  if(!nf->subscribe(true,onNotify)){g_cli->disconnect();return false;}a5(A5_SOC);delay(300);return true;}
+static void pollBms(){static const uint8_t cs[]={A5_SOC,A5_MOS,A5_STAT,A5_CV,A5_CT,A5_BAL,A5_FLT};for(uint8_t c:cs){a5(c);delay(45);web.handleClient();gnssPoll();}}
+
+// ---- GOOGLE SHEETS (C3 posts directly) -------------------------------------
+static void logSheet(){
+#if GS_ENABLE
+  if(WiFi.status()!=WL_CONNECTED||!b.valid)return;
+  static uint32_t last=0;if(millis()-last<GS_MIN_MS)return;last=millis();
+  String q="?id="+String(g_selMac)+"&v="+String(b.v,1)+"&i="+String(b.i,1)+"&soc="+String(b.soc,1)
+    +"&ah="+String(b.ah,1)+"&kw="+String(b.kw,3)+"&eo="+String((float)b.kwhOut,3)+"&cyc="+String(b.cyc)
+    +"&dmv="+String(b.dmv)+"&t="+String(b.temp)+"&hv="+verdict()
+    +"&lat="+String(g.lat,6)+"&lon="+String(g.lon,6)+"&spd="+String(g.spd,1)+"&sat="+String(g.sats)+"&fix="+String(g.fix?1:0);
+  WiFiClientSecure cli;cli.setInsecure();
+  if(!cli.connect(GS_HOST,443)){Serial.println("[GS] connect fail");return;}
+  cli.print(String("GET ")+GS_PATH+q+" HTTP/1.1\r\nHost: "+GS_HOST+"\r\nConnection: close\r\n\r\n");
+  uint32_t t=millis();while(cli.connected()&&millis()-t<4000){if(cli.available())cli.read();}cli.stop();
+  Serial.println("[GS] row sent");
+#endif
+}
+
+// ---- WEB API ---------------------------------------------------------------
+static void apiFound(){String j="[";for(uint8_t i=0;i<g_nFound;i++){if(i)j+=',';j+="{\"n\":\""+String(g_found[i].name)+"\",\"m\":\""+String(g_found[i].mac)+"\",\"r\":"+String(g_found[i].rssi)+"}";}j+="]";web.send(200,"application/json",j);}
+static void apiSelect(){if(web.hasArg("m")){strncpy(g_selMac,web.arg("m").c_str(),17);g_haveSel=true;g_proto=P_NONE;b.valid=false;}web.send(200,"text/plain","ok");}
+static void apiBack(){g_haveSel=false;g_selMac[0]=0;if(g_online&&g_cli)g_cli->disconnect();web.send(200,"text/plain","ok");}
+static void apiData(){bool ok=g_online&&b.valid&&(millis()-b.lastMs<STALE_MS);
+  String j="{\"sel\":"+String(g_haveSel?1:0)+",\"ok\":"+String(ok?1:0)+",\"mac\":\""+String(g_selMac)+"\"";
+  j+=",\"v\":"+String(b.v,1)+",\"i\":"+String(b.i,1)+",\"kw\":"+String(b.kw,2)+",\"soc\":"+String(b.soc,1)+",\"ah\":"+String(b.ah,1)+",\"cyc\":"+String(b.cyc);
+  j+=",\"avg\":"+String(b.avg)+",\"dmv\":"+String(b.dmv)+",\"hv\":\""+verdict()+"\"";
+  j+=",\"mn\":"+String(b.mn)+",\"mni\":"+String(b.mni)+",\"mx\":"+String(b.mx)+",\"mxi\":"+String(b.mxi);
+  j+=",\"t\":"+String(b.temp)+",\"st\":"+String(b.st)+",\"chg\":"+String(b.chg?1:0)+",\"dsg\":"+String(b.dsg?1:0)+",\"bal\":"+String(b.bal?1:0)+",\"flt\":"+String(b.fault?1:0)+",\"life\":"+String(b.life)+",\"eo\":"+String((float)b.kwhOut,3);
+  j+=",\"fix\":"+String(g.fix?1:0)+",\"lat\":"+String(g.lat,6)+",\"lon\":"+String(g.lon,6)+",\"spd\":"+String(g.spd,1)+",\"sat\":"+String(g.sats);
+  j+=",\"c\":[";for(uint8_t i=0;i<b.ns;i++){if(i)j+=',';j+=String(b.cellmV[i]);}j+="]}";web.send(200,"application/json",j);}
+
+static const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>EV Bike</title><style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0e14;color:#e8eef7;font:15px/1.4 system-ui,sans-serif;padding:14px;max-width:520px;margin:auto}
+h1{font-size:16px}.sub{font-size:11px;color:#7d8da3;margin-bottom:12px}.pill{float:right;font-size:10px;padding:3px 9px;border-radius:99px;background:#0e141c;border:1px solid #1f2937}
+.card{background:#131a24;border:1px solid #1f2937;border-radius:14px;padding:14px;margin-bottom:11px}
+.dev{display:flex;justify-content:space-between;align-items:center;padding:13px;border-radius:11px;background:#0e141c;border:1px solid #1f2937;margin-bottom:9px}
+.dev:active{background:#1a2330}.dev .r{font-size:11px;color:#7d8da3}.sig{display:inline-block;width:34px;height:6px;border-radius:3px;background:#243040;margin-left:8px;overflow:hidden}.sig>i{display:block;height:100%;background:#00e08a}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:11px}.t{background:#131a24;border:1px solid #1f2937;border-radius:12px;padding:11px;text-align:center}
+.t .k{font-size:9px;color:#7d8da3;text-transform:uppercase}.t .v{font-size:20px;font-weight:650;margin-top:3px}.t .u{font-size:10px;color:#7d8da3}
+.ring{display:flex;flex-direction:column;align-items:center;padding:16px}.ring b{font-size:40px;font-weight:700}.ring small{font-size:10px;color:#7d8da3;letter-spacing:2px}
+.bars{display:flex;flex-direction:column;gap:4px}.bar{display:flex;align-items:center;gap:8px;font-size:11px}.bar .n{width:20px;color:#7d8da3}.bar .bg{flex:1;height:14px;background:#0e141c;border-radius:4px;overflow:hidden}
+.bar .f{height:100%;background:#38bdf8}.bar .f.hi{background:#fbbf24}.bar .f.lo{background:#f87171}.bar .mv{width:48px;text-align:right;font-weight:600}
+.row{display:flex;justify-content:space-between;font-size:11px;color:#7d8da3;margin-bottom:9px}.mos{display:flex;gap:7px}.m{flex:1;text-align:center;padding:8px;border-radius:9px;background:#0e141c;border:1px solid #1f2937;font-size:9px;color:#7d8da3;text-transform:uppercase}.m b{display:block;font-size:12px;margin-top:2px}
+.btn{width:100%;padding:11px;border-radius:10px;background:#1a2330;border:1px solid #2b3648;color:#e8eef7;font-size:13px}.gps{font-size:12px;line-height:1.7}.gps a{color:#38bdf8}.badge{font-size:9px;font-weight:700;padding:3px 8px;border-radius:5px}
+</style></head><body>
+<h1>EV Bike <span class=pill id=net>--</span></h1><div class=sub id=sub>starting…</div>
+<div id=disco><div class=card><b>Bikes in range</b><div class=sub>Tap one to connect &amp; log</div><div id=list><div class=sub>scanning…</div></div></div></div>
+<div id=live style=display:none>
+<div class=card ring><b id=soc>--</b><small>SOC %</small></div>
+<div class=g3><div class=t><div class=k>Volts</div><div class=v id=v>--</div></div><div class=t><div class=k>Amps</div><div class=v id=i>--</div></div><div class=t><div class=k>kW</div><div class=v id=kw>--</div></div></div>
+<div class=g3><div class=t><div class=k>Ah</div><div class=v id=ah>--</div></div><div class=t><div class=k>Temp</div><div class=v><span id=tp>--</span><span class=u>°C</span></div></div><div class=t><div class=k>Cycles</div><div class=v id=cyc>--</div></div></div>
+<div class=card><div class=row><b style=color:#e8eef7>GPS</b><span class=badge id=fixb>NO FIX</span></div><div class=gps id=gps>waiting…</div></div>
+<div class=card><div class=row><span>Cell balance</span><span class=badge id=hb>--</span></div><div class=row><span>min <b id=mn style=color:#e8eef7>--</b></span><span>Δ <b id=dmv style=color:#e8eef7>--</b> mV</span><span>max <b id=mx style=color:#e8eef7>--</b></span></div><div class=bars id=bars></div></div>
+<div class=card><div class=mos><div class=m>Chg<b id=cm>--</b></div><div class=m>Dsg<b id=dm>--</b></div><div class=m>Bal<b id=bl>--</b></div><div class=m>Energy<b id=eo>--</b></div></div></div>
+<button class=btn onclick=back()>← Back to bike list</button></div>
+<script>
+var $=function(x){return document.getElementById(x)};
+function sig(r){return Math.max(5,Math.min(100,2*(r+100)))}
+function drawList(a){if(!a.length){$('list').innerHTML='<div class=sub>no DL- devices yet…</div>';return}
+ $('list').innerHTML=a.map(function(d){return '<div class=dev onclick="pick(\''+d.m+'\')"><div><b>'+d.n+'</b><div class=r>'+d.m+'</div></div><div class=r>'+d.r+' dBm<span class=sig><i style="width:'+sig(d.r)+'%"></i></span></div></div>'}).join('')}
+function pick(m){fetch('/sel?m='+m)}
+function back(){fetch('/back').then(function(){$('live').style.display='none';$('disco').style.display='block'})}
+function drawLive(d){$('disco').style.display='none';$('live').style.display='block';
+ $('sub').textContent=d.mac+(d.ok?' · LIVE':' · connecting…');
+ $('soc').textContent=d.soc.toFixed(1);$('v').textContent=d.v.toFixed(1);$('i').textContent=d.i.toFixed(1);
+ $('kw').textContent=Math.abs(d.kw).toFixed(2);$('ah').textContent=d.ah.toFixed(1);$('tp').textContent=d.t;$('cyc').textContent=d.cyc;$('eo').textContent=d.eo.toFixed(2);
+ $('fixb').textContent=d.fix?(d.sat+' sats'):'NO FIX';$('fixb').style.background=d.fix?'#0c3':'#333';
+ $('gps').innerHTML=d.fix?('lat <b>'+d.lat.toFixed(6)+'</b>  lon <b>'+d.lon.toFixed(6)+'</b><br>speed '+d.spd.toFixed(1)+' km/h<br><a target=_blank href="https://maps.google.com/?q='+d.lat+','+d.lon+'">open in maps ↗</a>'):'waiting… ('+d.sat+' in view)';
+ var hb=$('hb');hb.textContent=d.hv;var col={OK:'#00e08a',LOAD:'#a78bfa',WATCH:'#ffb020',ALARM:'#ff4d5e'}[d.hv]||'#7d8da3';hb.style.background=col;hb.style.color='#000';
+ $('mn').textContent=d.mn;$('mx').textContent=d.mx;$('dmv').textContent=d.dmv;
+ var lo=d.mn-3,sp=Math.max(d.mx-d.mn+6,1),h='';d.c.forEach(function(mv,k){var w=Math.max(4,(mv-lo)/sp*100);var c=(k+1)==d.mxi?'f hi':(k+1)==d.mni?'f lo':'f';h+='<div class=bar><span class=n>'+(k+1)+'</span><div class=bg><div class="'+c+'" style="width:'+w+'%"></div></div><span class=mv>'+mv+'</span></div>'})$('bars').innerHTML=h;
+ function set(id,on){$(id).textContent=on?'ON':'OFF';$(id).style.color=on?'#00e08a':'#7d8da3'}set('cm',d.chg);set('dm',d.dsg);$('bl').textContent=d.bal?'ON':'OFF';}
+function tick(){fetch('/data').then(function(r){return r.json()}).then(function(d){$('net').textContent=NETLBL;if(d.sel)drawLive(d);else{$('live').style.display='none';$('disco').style.display='block';$('sub').textContent='select a bike';fetch('/found').then(function(r){return r.json()}).then(drawList)}}).catch(function(){})}
+setInterval(tick,1000);tick();
+</script></body></html>)HTML";
+static void handleRoot(){String p((const char*)PAGE);p.replace("NETLBL","'STA "+WiFi.localIP().toString()+"'");web.send(200,"text/html",p);}
+
+void setup(){
+  Serial.begin(115200);uint32_t t0=millis();while(!Serial&&millis()-t0<2500)delay(10);
+  Serial.println("\n== EV Bike Node -- OPTION A (STA -> Sheets) ==");
+  GNSS.begin(GNSS_BAUD,SERIAL_8N1,GNSS_RX,GNSS_TX);
+  WiFi.mode(WIFI_STA);WiFi.begin(STA_SSID,STA_PASS);
+  Serial.print("Joining hotspot");
+  for(int k=0;k<40&&WiFi.status()!=WL_CONNECTED;k++){delay(250);Serial.print(".");}
+  Serial.println();
+  if(WiFi.status()==WL_CONNECTED){Serial.println("Dashboard: http://"+WiFi.localIP().toString());}
+  else Serial.println("[WiFi] FAILED - check SSID/PASS and keep hotspot awake");
+  web.on("/",handleRoot);web.on("/data",apiData);web.on("/found",apiFound);web.on("/sel",apiSelect);web.on("/back",apiBack);web.begin();
+  NimBLEDevice::init("");NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEScan*s=NimBLEDevice::getScan();s->setScanCallbacks(&g_scanCB,false);s->setActiveScan(true);s->setInterval(100);s->setWindow(80);s->start(SCAN_S,false);
+}
+void loop(){
+  web.handleClient();gnssPoll();
+  static uint32_t poll=0;
+  if(g_connect){g_connect=false;if(!connectSel()){delay(1200);NimBLEDevice::getScan()->start(SCAN_S,false);}}
+  if(g_online&&millis()-poll>=POLL_MS){poll=millis();pollBms();logSheet();}
+  if(!g_online&&!g_connect&&!NimBLEDevice::getScan()->isScanning())NimBLEDevice::getScan()->start(SCAN_S,false);
+}
+
