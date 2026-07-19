@@ -1,0 +1,113 @@
+/*
+ * =============================================================================
+ *  GNSS via TinyGPS++  --  E108-GN03D -> ESP32-C3
+ * =============================================================================
+ *  Robust NMEA parsing with the battle-tested TinyGPS++ library (same one that
+ *  worked for you before). Prints lat/lon, speed, UTC+local time, date, and an
+ *  accuracy radius. Also shows a LIVE acquisition line (sats seen + HDOP) every
+ *  second so you can watch it lock even before it fixes.
+ *
+ *  INSTALL LIBRARY: Arduino IDE -> Library Manager -> search "TinyGPSPlus"
+ *                   by Mikal Hart -> Install.
+ *
+ *  WIRING (proven working on your board):
+ *      GN03D VCC (red)   -> 3V3
+ *      GN03D GND (black) -> GND
+ *      GN03D TXD         -> GPIO4     <- module output to C3
+ *      GN03D RXD         -> GPIO5     (optional)
+ *
+ *  ABOUT THE FIX:
+ *    - The library does NOT create a fix; the module does, from satellites.
+ *    - Your module is cold-starting after long storage -> give it 5-15 min,
+ *      near a window or outside. Watch "sats" climb below. At 4+ sats with
+ *      HDOP under ~5 it will fix and coordinates appear.
+ *    - "$GPTXT ANTENNA OPEN" = it wants an active antenna; connect one and
+ *      short RF_POWER if present for much faster/stronger lock.
+ *
+ *  BOARD: ESP32C3 Dev Module | USB CDC On Boot: Enabled | 115200 baud
+ * =============================================================================
+ */
+
+#include <TinyGPS++.h>
+
+#define GNSS_RX   4        // <- GN03D TXD
+#define GNSS_TX   5        // -> GN03D RXD (optional)
+#define GNSS_BAUD 9600
+#define TZ_OFFSET 5        // Pakistan = UTC+5 (for local-time display)
+
+HardwareSerial GPS(1);
+TinyGPSPlus gps;
+
+static void printFix() {
+  Serial.println(F("========================================"));
+
+  // --- position ---
+  if (gps.location.isValid()) {
+    Serial.printf("LAT/LON : %.6f, %.6f\n", gps.location.lat(), gps.location.lng());
+    Serial.printf("MAPS    : https://maps.google.com/?q=%.6f,%.6f\n",
+                  gps.location.lat(), gps.location.lng());
+  } else {
+    Serial.println(F("LAT/LON : --- no fix yet ---"));
+  }
+
+  // --- speed ---
+  if (gps.speed.isValid())
+    Serial.printf("SPEED   : %.1f km/h\n", gps.speed.kmph());
+  else
+    Serial.println(F("SPEED   : --"));
+
+  // --- time (UTC + local) ---
+  if (gps.time.isValid() && gps.date.isValid()) {
+    int lh = (gps.time.hour() + TZ_OFFSET) % 24;
+    Serial.printf("TIME    : %02d:%02d:%02d UTC  (%02d:%02d local)\n",
+                  gps.time.hour(), gps.time.minute(), gps.time.second(),
+                  lh, gps.time.minute());
+    Serial.printf("DATE    : %04d-%02d-%02d\n",
+                  gps.date.year(), gps.date.month(), gps.date.day());
+  } else {
+    Serial.println(F("TIME    : -- (comes with fix)"));
+  }
+
+  // --- accuracy radius from HDOP ---
+  if (gps.hdop.isValid()) {
+    double hdop = gps.hdop.hdop();
+    double radius = hdop * 2.5;                 // rough metres: HDOP x ~2.5
+    const char* q = hdop < 2 ? "excellent" : hdop < 5 ? "good"
+                  : hdop < 10 ? "moderate" : "poor";
+    Serial.printf("ACCURACY: HDOP %.1f  ~%.0f m radius (%s)\n", hdop, radius, q);
+  }
+
+  Serial.printf("SATS    : %d used\n", gps.satellites.value());
+}
+
+void setup() {
+  Serial.begin(115200);
+  uint32_t t0 = millis(); while (!Serial && millis() - t0 < 2500) delay(10);
+  Serial.println(F("\n== GNSS via TinyGPS++ =="));
+  Serial.print(F("TinyGPS++ v")); Serial.println(TinyGPSPlus::libraryVersion());
+  Serial.println(F("Watch 'sats' climb. Needs 4+ for a fix. Cold start = minutes.\n"));
+  GPS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX, GNSS_TX);
+}
+
+void loop() {
+  // feed every incoming byte to the parser
+  while (GPS.available()) gps.encode(GPS.read());
+
+  static uint32_t tFix = 0, tLive = 0;
+
+  // full report every 3s
+  if (millis() - tFix >= 3000) { tFix = millis(); printFix(); }
+
+  // quick live acquisition line every 1s (so you can watch it lock)
+  if (millis() - tLive >= 1000) {
+    tLive = millis();
+    Serial.printf("[acquiring] sats=%d  hdop=%s  chars=%lu  ok=%lu  bad=%lu\n",
+                  gps.satellites.value(),
+                  gps.hdop.isValid() ? String(gps.hdop.hdop(),1).c_str() : "--",
+                  gps.charsProcessed(), gps.passedChecksum(), gps.failedChecksum());
+  }
+
+  // sanity: if no bytes ever arrive, the wiring regressed
+  if (millis() > 8000 && gps.charsProcessed() < 10)
+    Serial.println(F("[!] no GPS data - check TXD->GPIO4 wiring"));
+}
