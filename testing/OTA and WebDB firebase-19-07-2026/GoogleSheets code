@@ -1,0 +1,107 @@
+/**
+ * ===========================================================================
+ *  EV BIKE TELEMETRY  ->  GOOGLE SHEETS  (bind by Sheet ID)
+ * ===========================================================================
+ *
+ *  Appends ONE new row per request. Columns:
+ *  Serial | Timestamp | GPS... | BMS... | RSSI
+ *
+ *  SETUP
+ *  -----
+ *   1. Create a new Google Sheet.
+ *   2. Copy its ID from the URL:
+ *        docs.google.com/spreadsheets/d/<<<THIS_PART_IS_THE_ID>>>/edit
+ *      Paste it into SHEET_ID below.
+ *   3. Extensions -> Apps Script -> paste ALL of this.
+ *   4. Deploy -> New deployment -> Web app ->
+ *        Execute as: Me | Who has access: Anyone -> copy the /exec URL.
+ *   5. Put that /exec URL into the firmware.
+ *
+ *  Because this uses openById(), the script can live anywhere -- it does NOT
+ *  need to be bound to the sheet. That's the only difference from the
+ *  getActiveSpreadsheet() version.
+ * ===========================================================================
+ */
+
+// ---- PASTE YOUR SHEET ID HERE (from the sheet's URL) ----------------------
+var SHEET_ID   = '1VKMw7wuelku01M2dsu_t3gtN8feR2PtOdl5g7icAB4Q';
+
+var TAB_NAME   = 'Telemetry';   // the tab within the spreadsheet
+var SECRET     = '';            // optional token; '' = open. If set, firmware must send &key=...
+
+// Serial + Timestamp FIRST, RSSI LAST.
+var HEADERS = [
+  'Serial', 'Timestamp',
+  'Lat', 'Lon', 'Speed (km/h)', 'Sats', 'Fix',
+  'Bike ID', 'Voltage (V)', 'Current (A)', 'Power (kW)',
+  'SOC (%)', 'Remaining (Ah)', 'Energy Out (kWh)', 'Energy In (kWh)', 'Cycles',
+  'Avg Cell (mV)', 'Delta (mV)', 'Min Cell (mV)', 'Max Cell (mV)',
+  'Temp (C)', 'Health',
+  'Chg MOS', 'Dsg MOS', 'Balancing', 'Fault', 'BMS Life',
+  'RSSI (dBm)'
+];
+
+function doGet(e)  { return handle(e); }
+function doPost(e) { return handle(e); }
+
+function handle(e) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    var p = (e && e.parameter) ? e.parameter : {};
+
+    if (SECRET && p.key !== SECRET) {
+      return ContentService.createTextOutput('unauthorized');
+    }
+
+    var sh = getSheet_();
+    var serial = p.ser || sh.getLastRow();   // running count if firmware omits ser
+
+    var b   = function(x){ return (x === '1' || x === 'true' || x === 1) ? 'YES' : 'NO'; };
+    var num = function(x){ var n = parseFloat(x); return isNaN(n) ? '' : n; };
+
+    var row = [
+      serial,
+      new Date(),
+      num(p.lat), num(p.lon), num(p.spd), num(p.sat), b(p.fix),
+      p.id || '', num(p.v), num(p.i), num(p.kw),
+      num(p.soc), num(p.ah), num(p.eo), num(p.ei), num(p.cyc),
+      num(p.avg), num(p.dmv), num(p.mn), num(p.mx),
+      num(p.t), p.hv || '',
+      b(p.chg), b(p.dsg), b(p.bal), b(p.flt), num(p.life),
+      num(p.rssi)
+    ];
+
+    sh.appendRow(row);
+    return ContentService.createTextOutput('ok ' + serial);
+
+  } catch (err) {
+    return ContentService.createTextOutput('err ' + err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getSheet_() {
+  if (SHEET_ID === 'PASTE_YOUR_SHEET_ID_HERE' || !SHEET_ID) {
+    throw 'SHEET_ID not set';
+  }
+  var ss = SpreadsheetApp.openById(SHEET_ID);
+  var sh = ss.getSheetByName(TAB_NAME);
+  if (!sh) sh = ss.insertSheet(TAB_NAME);
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(HEADERS);
+    sh.getRange(1, 1, 1, HEADERS.length)
+      .setFontWeight('bold').setBackground('#1f2937').setFontColor('#ffffff');
+    sh.setFrozenRows(1);
+    sh.autoResizeColumns(1, HEADERS.length);
+  }
+  return sh;
+}
+
+/** Run once from the editor to create headers and to trigger the
+ *  authorization prompt before the ESP32 ever calls it. */
+function initSheet() {
+  getSheet_();
+  Logger.log('Sheet ready: ' + SHEET_ID);
+}
