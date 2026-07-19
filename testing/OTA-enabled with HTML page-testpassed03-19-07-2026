@@ -1,0 +1,422 @@
+/*
+ * =============================================================================
+ *  EV BIKE TELEMETRY: API ONLY (No HTML Hosted on ESP32)
+ * =============================================================================
+ */
+
+#include <NimBLEDevice.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <TinyGPS++.h>
+#include <HTTPClient.h>
+#include <ArduinoOTA.h>
+
+#define BIKE_ID        "EVBIKE-01"
+#define STA_SSID       "HHRCM1"
+#define STA_PASS       "24456883"
+#define MDNS_NAME      "evbike"         
+
+const String GAS_URL = "https://script.google.com/macros/s/AKfycbw_DGzUBRAdccXSBPSbGTc_Sm1mp582IAf1xhaVuF3JJ-DUlzbDNk-aPIGIK1abe0H0/exec";
+const uint32_t SHEETS_INTERVAL_MS = 15000;
+
+#define GNSS_RX        4
+#define GNSS_TX        5
+#define GNSS_BAUD      9600
+
+#define TRACK_INTERVAL_MS  10000 
+#define TRACK_MAX_POINTS   180
+
+#define PACK_SERIES        15
+#define PACK_NOMINAL_AH    60.0f
+#define REST_CURRENT_A     1.0f
+#define DELTA_WATCH_MV     20
+#define DELTA_INVESTIGATE  50
+#define DELTA_ALARM_MV     100
+
+static const char *TARGET_NAME_EXACT  = "DL-1771060607EB";
+static const char *TARGET_NAME_PREFIX = "DL-";
+static const bool  USE_EXACT_NAME     = true;
+
+static const uint32_t POLL_INTERVAL_MS = 2000;
+static const uint32_t SCAN_TIME_S      = 5;
+static const uint32_t STALE_TIMEOUT_MS = 15000;
+
+#define MAX_CELLS 32
+#define MAX_TEMPS 8
+
+static NimBLEUUID SVC_UUID  ("0000fff0-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID CHR_NOTIFY("0000fff1-0000-1000-8000-00805f9b34fb");
+static NimBLEUUID CHR_WRITE ("0000fff2-0000-1000-8000-00805f9b34fb");
+
+HardwareSerial GPS(1);
+TinyGPSPlus gps;
+
+struct Coord { float lat, lng; };
+static Coord g_track[TRACK_MAX_POINTS];
+static uint16_t g_trackHead = 0;
+static uint16_t g_trackCount = 0;
+
+struct DalyData {
+  float    packVoltage = 0, current = 0, powerW = 0, powerKW = 0;
+  float    soc = 0, remainingAh = 0;
+  uint16_t cycles = 0;
+  uint8_t  cellCount = 0;
+  uint16_t cellmV[MAX_CELLS] = {0};
+  uint16_t maxCellmV = 0, minCellmV = 0, avgCellmV = 0, cellDeltamV = 0;
+  uint8_t  maxCellNum = 0, minCellNum = 0;
+  uint8_t  tempCount = 0;
+  int8_t   tempC[MAX_TEMPS] = {0};
+  bool     chgMos = false, dsgMos = false, balancing = false;
+  uint8_t  chargeState = 0, bmsLife = 0;
+  uint8_t  faultBytes[7] = {0};
+  bool     anyFault = false;
+  double   kWhIn = 0, kWhOut = 0;
+  bool     valid = false;
+  uint32_t lastUpdateMs = 0;
+  int      rssi = 0;
+};
+static DalyData g_bms;
+
+enum Protocol : uint8_t { PROTO_UNKNOWN = 0, PROTO_A5 = 0xA5, PROTO_D2 = 0xD2 };
+static Protocol g_proto = PROTO_UNKNOWN;
+
+static NimBLEClient             *g_client   = nullptr;
+static NimBLERemoteCharacteristic *g_chrWrite = nullptr;
+static NimBLEAdvertisedDevice     *g_target   = nullptr;
+static volatile bool g_doConnect = false, g_connected = false;
+static uint8_t g_rx[512];
+static size_t  g_rxLen = 0;
+
+static WebServer server(80);
+
+static void feedGPS() { while (GPS.available()) gps.encode(GPS.read()); }
+
+static void updateTrajectory() {
+  if (!gps.location.isValid() || gps.location.lat() == 0.0) return;
+  static uint32_t lastTrackMs = 0;
+  if (millis() - lastTrackMs >= TRACK_INTERVAL_MS || lastTrackMs == 0) {
+    lastTrackMs = millis();
+    g_track[g_trackHead].lat = gps.location.lat();
+    g_track[g_trackHead].lng = gps.location.lng();
+    g_trackHead = (g_trackHead + 1) % TRACK_MAX_POINTS;
+    if (g_trackCount < TRACK_MAX_POINTS) g_trackCount++;
+  }
+}
+
+static uint16_t be16(const uint8_t *p) { return (uint16_t)p[0] << 8 | p[1]; }
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static uint16_t crc16(const uint8_t *b, size_t n) {
+  uint16_t c = 0xFFFF;
+  for (size_t i = 0; i < n; i++) {
+    c ^= b[i]; for (uint8_t k = 0; k < 8; k++) c = (c & 1) ? (c >> 1) ^ 0xA001 : c >> 1;
+  } return c;
+}
+
+static const char *FAULT_NAMES[7][8] = {
+  {"Cell overvolt L1","Cell overvolt L2","Cell undervolt L1","Cell undervolt L2","Pack overvolt L1","Pack overvolt L2","Pack undervolt L1","Pack undervolt L2"},
+  {"Chg temp high L1","Chg temp high L2","Chg temp low L1","Chg temp low L2","Dsg temp high L1","Dsg temp high L2","Dsg temp low L1","Dsg temp low L2"},
+  {"Chg overcurrent L1","Chg overcurrent L2","Dsg overcurrent L1","Dsg overcurrent L2","SOC high L1","SOC high L2","SOC low L1","SOC low L2"},
+  {"Diff volt L1","Diff volt L2","Diff temp L1","Diff temp L2","-","-","-","-"},
+  {"Chg MOS temp high","Dsg MOS temp high","Chg MOS temp sensor fail","Dsg MOS temp sensor fail","Chg MOS adhesion fail","Dsg MOS adhesion fail","Chg MOS open fail","Dsg MOS open fail"},
+  {"AFE collect fail","Voltage collect drop","Cell temp sensor fail","EEPROM fail","RTC fail","Precharge fail","Comms fail","Internal comms fail"},
+  {"Current module fail","Pack volt detect fail","Short circuit protect fail","Low volt forbid charge","-","-","-","-"}
+};
+
+static String deltaVerdict() {
+  if (fabsf(g_bms.current) > REST_CURRENT_A) return "UNDER LOAD";
+  const uint16_t d = g_bms.cellDeltamV;
+  if (d < DELTA_WATCH_MV) return "HEALTHY";
+  if (d < DELTA_INVESTIGATE) return "WATCH";
+  if (d < DELTA_ALARM_MV) return "INVESTIGATE";
+  return "ALARM";
+}
+
+static void uploadToSheets() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!g_bms.valid && !gps.location.isValid()) return;
+
+  String url = GAS_URL + "?id=" + String(BIKE_ID);
+  url += "&lat=" + String(gps.location.isValid() ? gps.location.lat() : 0.0, 6);
+  url += "&lon=" + String(gps.location.isValid() ? gps.location.lng() : 0.0, 6);
+  url += "&spd=" + String(gps.speed.isValid() ? gps.speed.kmph() : 0.0, 1);
+  url += "&sat=" + String(gps.satellites.isValid() ? gps.satellites.value() : 0);
+  url += "&fix=" + String(gps.location.isValid() ? 1 : 0);
+  url += "&v=" + String(g_bms.packVoltage, 1); url += "&i=" + String(g_bms.current, 1);
+  url += "&kw=" + String(g_bms.powerKW, 3); url += "&soc=" + String(g_bms.soc, 1);
+  url += "&ah=" + String(g_bms.remainingAh, 1); url += "&eo=" + String((float)g_bms.kWhOut, 3);
+  url += "&ei=" + String((float)g_bms.kWhIn, 3); url += "&cyc=" + String(g_bms.cycles);
+  url += "&avg=" + String(g_bms.avgCellmV); url += "&dmv=" + String(g_bms.cellDeltamV);
+  url += "&mn=" + String(g_bms.minCellmV); url += "&mx=" + String(g_bms.maxCellmV);
+  url += "&t=" + String(g_bms.tempCount > 0 ? g_bms.tempC[0] : 0); url += "&hv=" + deltaVerdict();
+  url += "&chg=" + String(g_bms.chgMos ? 1 : 0); url += "&dsg=" + String(g_bms.dsgMos ? 1 : 0);
+  url += "&bal=" + String(g_bms.balancing ? 1 : 0); url += "&flt=" + String(g_bms.anyFault ? 1 : 0);
+  url += "&life=" + String(g_bms.bmsLife); url += "&rssi=" + String(g_bms.rssi);
+
+  url.replace(" ", "%20"); feedGPS(); 
+  HTTPClient http; http.begin(url); http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.GET(); http.end(); feedGPS(); 
+}
+
+enum : uint8_t { A5_SOC = 0x90, A5_MINMAX_V = 0x91, A5_MINMAX_T = 0x92, A5_MOS = 0x93, A5_STATUS = 0x94, A5_CELL_V = 0x95, A5_CELL_T = 0x96, A5_BALANCE = 0x97, A5_FAULTS = 0x98 };
+
+static void a5Send(uint8_t cmd) {
+  uint8_t f[13] = {0xA5, 0x80, cmd, 0x08, 0,0,0,0,0,0,0,0,0};
+  uint8_t cs = 0; for (int i = 0; i < 12; i++) cs += f[i]; f[12] = cs;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 13, false);
+}
+
+static void recomputeCellStats() {
+  if (!g_bms.cellCount) return;
+  uint32_t sum = 0; uint16_t mn = 0xFFFF, mx = 0; uint8_t mni = 0, mxi = 0, n = 0;
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) {
+    const uint16_t v = g_bms.cellmV[i]; if (!v) continue;
+    sum += v; n++;
+    if (v < mn) { mn = v; mni = i + 1; }
+    if (v > mx) { mx = v; mxi = i + 1; }
+  }
+  if (n != g_bms.cellCount) return;      
+  g_bms.avgCellmV = sum / n; g_bms.minCellmV = mn; g_bms.minCellNum = mni;
+  g_bms.maxCellmV = mx; g_bms.maxCellNum = mxi; g_bms.cellDeltamV = mx - mn;
+}
+
+static void integrateEnergy() {
+  static uint32_t lastMs = 0; const uint32_t now = millis();
+  if (!lastMs) { lastMs = now; return; }
+  const uint32_t dt = now - lastMs; lastMs = now; if (dt > 30000) return;                
+  const double kwh = (g_bms.powerW / 1000.0) * (dt / 3600000.0);
+  if (g_bms.current > 0.1f) g_bms.kWhIn += kwh;
+  else if (g_bms.current < -0.1f) g_bms.kWhOut += -kwh;
+}
+
+static void a5Parse(const uint8_t *f) {
+  const uint8_t cmd = f[2]; const uint8_t *d = &f[4];
+  switch (cmd) {
+    case A5_SOC:
+      g_bms.packVoltage = be16(d) * 0.1f; g_bms.current = ((int32_t)be16(d + 4) - 30000) * 0.1f; 
+      g_bms.soc = be16(d + 6) * 0.1f; g_bms.powerW = g_bms.packVoltage * g_bms.current;
+      g_bms.powerKW = g_bms.powerW / 1000.0f; integrateEnergy();
+      g_bms.valid = true; g_bms.lastUpdateMs = millis(); break;
+    case A5_MOS:
+      g_bms.chargeState = d[0]; g_bms.chgMos = d[1]; g_bms.dsgMos = d[2];
+      g_bms.bmsLife = d[3]; g_bms.remainingAh = be32(d + 4) / 1000.0f; break;
+    case A5_STATUS:
+      if (d[0] > 0 && d[0] <= MAX_CELLS) g_bms.cellCount = d[0];
+      if (d[1] > 0 && d[1] <= MAX_TEMPS) g_bms.tempCount = d[1];
+      g_bms.cycles = be16(d + 5); break;
+    case A5_CELL_V: {
+      const uint8_t fr = d[0]; if (!fr || fr > 11) break;
+      for (uint8_t i = 0; i < 3; i++) {
+        const uint8_t idx = (fr - 1) * 3 + i; if (idx >= MAX_CELLS) break;
+        const uint16_t mv = be16(d + 1 + i * 2);
+        if (mv > 0 && mv < 5000) g_bms.cellmV[idx] = mv;
+      }
+      if (g_bms.cellCount && fr >= (g_bms.cellCount + 2) / 3) recomputeCellStats(); break;
+    }
+    case A5_CELL_T: {
+      const uint8_t fr = d[0]; if (!fr) break;
+      for (uint8_t i = 0; i < 7; i++) {
+        const uint8_t idx = (fr - 1) * 7 + i; if (idx >= MAX_TEMPS) break;
+        g_bms.tempC[idx] = (int16_t)d[1 + i] - 40;
+      } break;
+    }
+    case A5_BALANCE: {
+      bool any = false; for (uint8_t i = 0; i < 6 && !any; i++) if (d[i]) any = true;
+      g_bms.balancing = any; break;
+    }
+    case A5_FAULTS: {
+      bool any = false; for (uint8_t i = 0; i < 7; i++) { g_bms.faultBytes[i] = d[i]; if (d[i]) any = true; }
+      g_bms.anyFault = any; break;
+    }
+    default: break;
+  }
+}
+
+static void a5Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 13) {
+    if (g_rx[i] != 0xA5) { i++; continue; }
+    uint8_t cs = 0; for (int k = 0; k < 12; k++) cs += g_rx[i + k];
+    if (cs != g_rx[i + 12]) { i++; continue; }
+    a5Parse(&g_rx[i]); i += 13;
+  }
+  if (i) { memmove(g_rx, g_rx + i, g_rxLen - i); g_rxLen -= i; }
+}
+
+static void d2SendReadAll() {
+  uint8_t f[8] = {0xD2, 0x03, 0x00, 0x00, 0x00, 0x3E, 0, 0};
+  const uint16_t c = crc16(f, 6); f[6] = c & 0xFF; f[7] = c >> 8;
+  if (g_chrWrite) g_chrWrite->writeValue(f, 8, false);
+}
+static void d2Parse(const uint8_t *p, size_t n) {
+  const uint8_t bc = p[2]; if (n < (size_t)(3 + bc + 2)) return;
+  const uint8_t *d = p + 3; auto reg = [&](uint8_t r) { return be16(d + r * 2); };
+  uint8_t cells = 0;
+  for (uint8_t i = 0; i < 32; i++) {
+    const uint16_t mv = reg(i); if (mv > 500 && mv < 5000) { g_bms.cellmV[i] = mv; cells = i + 1; }
+  }
+  if (cells) g_bms.cellCount = cells;
+  uint8_t temps = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    const int16_t t = (int16_t)reg(32 + i) - 40; if (t > -40 && t < 125) { g_bms.tempC[i] = t; temps = i + 1; }
+  }
+  if (temps) g_bms.tempCount = temps;
+  g_bms.packVoltage = reg(40) * 0.1f; g_bms.current = ((int32_t)reg(42) - 30000) * 0.1f;
+  g_bms.soc = reg(43) * 0.1f; g_bms.powerW = g_bms.packVoltage * g_bms.current;
+  g_bms.powerKW = g_bms.powerW / 1000.0f;
+  recomputeCellStats(); integrateEnergy(); g_bms.valid = true; g_bms.lastUpdateMs = millis();
+}
+static void d2Consume() {
+  size_t i = 0;
+  while (g_rxLen - i >= 5) {
+    if (g_rx[i] != 0xD2 || g_rx[i + 1] != 0x03) { i++; continue; }
+    const size_t total = 3 + g_rx[i + 2] + 2; if (g_rxLen - i < total) break;
+    const uint16_t got = g_rx[i + total - 2] | (g_rx[i + total - 1] << 8);
+    if (got != crc16(&g_rx[i], total - 2)) { i++; continue; }
+    d2Parse(&g_rx[i], total); i += total;
+  }
+  if (i) { memmove(g_rx, g_rx + i, g_rxLen - i); g_rxLen -= i; }
+}
+
+static void onNotify(NimBLERemoteCharacteristic *c, uint8_t *data, size_t len, bool n) {
+  if (g_rxLen + len > sizeof(g_rx)) g_rxLen = 0;
+  memcpy(g_rx + g_rxLen, data, len); g_rxLen += len;
+  if (g_proto == PROTO_UNKNOWN) {
+    for (size_t i = 0; i < g_rxLen; i++) {
+      if (g_rx[i] == 0xA5) { g_proto = PROTO_A5; break; }
+      if (g_rx[i] == 0xD2 && i + 1 < g_rxLen && g_rx[i + 1] == 0x03) { g_proto = PROTO_D2; break; }
+    }
+  }
+  if (g_proto == PROTO_A5) a5Consume(); else if (g_proto == PROTO_D2) d2Consume();
+}
+
+class ClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *c) override { c->updateConnParams(24, 48, 0, 400); g_connected = true; }
+  void onDisconnect(NimBLEClient *c, int r) override {
+    g_connected = false; g_bms.valid = false; g_proto = PROTO_UNKNOWN; g_rxLen = 0;
+    NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+  }
+};
+static ClientCB g_clientCB;
+
+class ScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice *d) override {
+    if (!d->haveName()) return;
+    const std::string n = d->getName();
+    const bool hit = USE_EXACT_NAME ? (n == TARGET_NAME_EXACT) : (n.rfind(TARGET_NAME_PREFIX, 0) == 0);
+    if (!hit) return;
+    g_bms.rssi = d->getRSSI(); NimBLEDevice::getScan()->stop();
+    g_target = const_cast<NimBLEAdvertisedDevice *>(d); g_doConnect = true;
+  }
+};
+static ScanCB g_scanCB;
+
+static bool connectToBms() {
+  if (!g_client) { g_client = NimBLEDevice::createClient(); g_client->setClientCallbacks(&g_clientCB, false); g_client->setConnectTimeout(10000); }
+  if (!g_client->connect(g_target)) return false;
+  NimBLERemoteService *svc = g_client->getService(SVC_UUID); if (!svc) { g_client->disconnect(); return false; }
+  NimBLERemoteCharacteristic *nf = svc->getCharacteristic(CHR_NOTIFY); g_chrWrite = svc->getCharacteristic(CHR_WRITE);
+  if (!nf || !g_chrWrite || !nf->subscribe(true, onNotify)) { g_client->disconnect(); return false; }
+  a5Send(A5_SOC); uint32_t t = millis(); while(millis() - t < 400) { feedGPS(); delay(5); }
+  if (g_proto == PROTO_UNKNOWN) { d2SendReadAll(); t = millis(); while(millis() - t < 400) { feedGPS(); delay(5); } }
+  return true;
+}
+
+static void pollBms() {
+  if (g_proto == PROTO_D2) { d2SendReadAll(); return; }
+  static const uint8_t cmds[] = { A5_SOC, A5_MOS, A5_STATUS, A5_CELL_V, A5_CELL_T, A5_BALANCE, A5_FAULTS };
+  for (uint8_t c : cmds) { 
+    a5Send(c); uint32_t t = millis(); while (millis() - t < 50) { feedGPS(); server.handleClient(); delay(1); }
+  }
+  if (g_proto == PROTO_UNKNOWN) d2SendReadAll();
+}
+
+static void handleData() {
+  // IMPORTANT: This header allows the external HTML file to fetch data without being blocked by the browser.
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  String j; j.reserve(8192);
+  j = "{"; j += "\"id\":\"" BIKE_ID "\"";
+  j += ",\"ok\":" + String(g_connected && g_bms.valid && (millis() - g_bms.lastUpdateMs < STALE_TIMEOUT_MS) ? 1 : 0);
+  j += ",\"rssi\":" + String(g_bms.rssi); j += ",\"v\":" + String(g_bms.packVoltage, 1);
+  j += ",\"i\":" + String(g_bms.current, 1); j += ",\"kw\":" + String(g_bms.powerKW, 3);
+  j += ",\"soc\":" + String(g_bms.soc, 1); j += ",\"ah\":" + String(g_bms.remainingAh, 1);
+  j += ",\"ahn\":" + String(PACK_NOMINAL_AH, 0); j += ",\"ein\":" + String((float)g_bms.kWhIn, 3);
+  j += ",\"eout\":" + String((float)g_bms.kWhOut, 3); j += ",\"cyc\":" + String(g_bms.cycles);
+  j += ",\"ns\":" + String(g_bms.cellCount); j += ",\"avg\":" + String(g_bms.avgCellmV);
+  j += ",\"dmv\":" + String(g_bms.cellDeltamV); j += ",\"mn\":" + String(g_bms.minCellmV);
+  j += ",\"mni\":" + String(g_bms.minCellNum); j += ",\"mx\":" + String(g_bms.maxCellmV);
+  j += ",\"mxi\":" + String(g_bms.maxCellNum); j += ",\"hv\":\"" + deltaVerdict() + "\"";
+  j += ",\"st\":" + String(g_bms.chargeState); j += ",\"chg\":" + String(g_bms.chgMos ? 1 : 0);
+  j += ",\"dsg\":" + String(g_bms.dsgMos ? 1 : 0); j += ",\"bal\":" + String(g_bms.balancing ? 1 : 0);
+  j += ",\"life\":" + String(g_bms.bmsLife); j += ",\"up\":" + String(millis() / 1000);
+  j += ",\"lat\":" + String(gps.location.isValid() ? gps.location.lat() : 0.0, 6);
+  j += ",\"lng\":" + String(gps.location.isValid() ? gps.location.lng() : 0.0, 6);
+  j += ",\"spd\":" + String(gps.speed.isValid() ? gps.speed.kmph() : 0.0, 1);
+  j += ",\"sats\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0);
+  j += ",\"trk\":[";
+  for (uint16_t i = 0; i < g_trackCount; i++) {
+    uint16_t idx = (g_trackHead - g_trackCount + i + TRACK_MAX_POINTS) % TRACK_MAX_POINTS;
+    if (i > 0) j += ","; j += "[" + String(g_track[idx].lat, 6) + "," + String(g_track[idx].lng, 6) + "]";
+  }
+  j += "],\"t\":[";
+  for (uint8_t i = 0; i < g_bms.tempCount; i++) { if (i) j += ','; j += String(g_bms.tempC[i]); }
+  j += "],\"c\":[";
+  for (uint8_t i = 0; i < g_bms.cellCount; i++) { if (i) j += ','; j += String(g_bms.cellmV[i]); }
+  j += "],\"f\":[";
+  bool first = true;
+  for (uint8_t b = 0; b < 7; b++)
+    for (uint8_t bit = 0; bit < 8; bit++)
+      if (g_bms.faultBytes[b] & (1 << bit)) {
+        if (!first) j += ','; j += "\"" + String(FAULT_NAMES[b][bit]) + "\""; first = false;
+      }
+  j += "]}";
+  server.send(200, "application/json", j);
+}
+
+void setup() {
+  Serial.begin(115200);
+  GPS.setRxBufferSize(1024); GPS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX, GNSS_TX);
+
+  const uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10); delay(300);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(STA_SSID, STA_PASS);
+  
+  server.on("/api/data", handleData); server.begin();
+  MDNS.begin(MDNS_NAME);
+
+  NimBLEDevice::init(""); NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEScan *s = NimBLEDevice::getScan(); s->setScanCallbacks(&g_scanCB, false);
+  s->setActiveScan(true); s->setInterval(100); s->setWindow(80);
+  s->start(SCAN_TIME_S, false);
+}
+
+void loop() {
+  feedGPS(); updateTrajectory(); server.handleClient();   
+
+  static uint32_t lastPoll = 0, lastUpload = 0;
+  static bool wasConnected = false, otaInitialized = false;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wasConnected) {
+      wasConnected = true;
+      if (!otaInitialized) {
+        ArduinoOTA.setHostname("evbike");
+        ArduinoOTA.begin();
+        otaInitialized = true;
+      }
+    }
+    if (otaInitialized) ArduinoOTA.handle();
+  } else if (wasConnected) {
+    wasConnected = false;
+  }
+  
+  if (g_doConnect) {
+    g_doConnect = false;
+    if (!connectToBms()) { uint32_t t = millis(); while(millis() - t < 1500) { feedGPS(); delay(10); } NimBLEDevice::getScan()->start(SCAN_TIME_S, false); }
+  }
+  if (g_connected && millis() - lastPoll >= POLL_INTERVAL_MS) { lastPoll = millis(); pollBms(); }
+  if (millis() - lastUpload >= SHEETS_INTERVAL_MS) { lastUpload = millis(); uploadToSheets(); }
+  if (!g_connected && !g_doConnect && !NimBLEDevice::getScan()->isScanning()) NimBLEDevice::getScan()->start(SCAN_TIME_S, false);
+}
